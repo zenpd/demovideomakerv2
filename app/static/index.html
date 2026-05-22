@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Demo Video Maker</title>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --accent: #58a6ff; --accent2: #3fb950; --text: #e6edf3;
+    --muted: #8b949e; --danger: #f85149;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; min-height: 100vh; }
+
+  header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 16px 32px; display: flex; align-items: center; gap: 12px; }
+  header .logo { font-size: 22px; font-weight: 700; color: var(--accent); }
+  header .sub { color: var(--muted); font-size: 13px; }
+
+  .container { max-width: 900px; margin: 32px auto; padding: 0 24px; }
+
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 24px; margin-bottom: 24px; }
+  .card h2 { font-size: 16px; font-weight: 600; margin-bottom: 16px; color: var(--accent); }
+
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media(max-width:600px) { .grid2 { grid-template-columns: 1fr; } }
+
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: .5px; }
+  input, select, textarea {
+    width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    color: var(--text); padding: 10px 14px; font-size: 14px; outline: none;
+    transition: border-color .2s;
+  }
+  input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+  textarea { resize: vertical; min-height: 180px; font-family: 'SF Mono', 'Consolas', monospace; font-size: 13px; }
+
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 12px 28px; border-radius: 8px; border: none; cursor: pointer;
+    font-size: 15px; font-weight: 600; transition: all .2s;
+  }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:hover { background: #79c0ff; }
+  .btn-primary:disabled { background: #21262d; color: var(--muted); cursor: not-allowed; }
+  .btn-secondary { background: transparent; border: 1px solid var(--border); color: var(--text); }
+  .btn-secondary:hover { border-color: var(--accent); color: var(--accent); }
+
+  .progress-card { display: none; }
+  .progress-card.active { display: block; }
+  .progress-bar-bg { background: var(--border); border-radius: 99px; height: 8px; overflow: hidden; margin: 12px 0; }
+  .progress-bar-fill { background: linear-gradient(90deg, var(--accent), var(--accent2)); height: 8px; border-radius: 99px; transition: width .4s; }
+  .status-msg { font-size: 14px; color: var(--muted); }
+  .status-msg.error { color: var(--danger); }
+
+  .result-card { display: none; }
+  .result-card.active { display: block; }
+  .result-card h2 { color: var(--accent2); }
+  .video-wrap { margin-top: 16px; }
+  video { width: 100%; border-radius: 8px; border: 1px solid var(--border); background: #000; }
+  .dl-row { display: flex; gap: 12px; margin-top: 16px; flex-wrap: wrap; }
+
+  .tip { background: #1c2d40; border: 1px solid #1f4580; border-radius: 8px; padding: 12px 16px; font-size: 13px; color: #79c0ff; }
+  .tip strong { display: block; margin-bottom: 4px; }
+
+  .voice-search { margin-bottom: 8px; }
+  .stats { display: flex; gap: 24px; flex-wrap: wrap; margin-top: 12px; }
+  .stat { text-align: center; }
+  .stat .num { font-size: 22px; font-weight: 700; color: var(--accent); }
+  .stat .lbl { font-size: 11px; color: var(--muted); text-transform: uppercase; }
+
+  .spinner { display: inline-block; width: 18px; height: 18px; border: 2px solid rgba(255,255,255,.3); border-top-color: #fff; border-radius: 50%; animation: spin .7s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">🎬 Demo Video Maker</div>
+  <div class="sub">Turn any narrative script + live URL → polished 4-min demo video</div>
+</header>
+
+<div class="container">
+
+  <!-- Config card -->
+  <div class="card" id="form-card">
+    <h2>⚙️ Configuration</h2>
+    <div class="grid2">
+      <div>
+        <label>App URL *</label>
+        <input id="app_url" type="url" placeholder="http://localhost:5173" value="http://localhost:5173" />
+      </div>
+      <div>
+        <label>Voice</label>
+        <input id="voice-search" class="voice-search" placeholder="Search voices…" oninput="filterVoices(this.value)" />
+        <select id="voice" style="margin-top:4px"></select>
+      </div>
+      <div>
+        <label>Resolution</label>
+        <select id="resolution">
+          <option value="1280x720" selected>1280×720 (HD)</option>
+          <option value="1920x1080">1920×1080 (Full HD)</option>
+          <option value="1024x768">1024×768</option>
+        </select>
+      </div>
+      <div>
+        <label>Max Duration</label>
+        <select id="max_duration">
+          <option value="120">2 minutes</option>
+          <option value="180">3 minutes</option>
+          <option value="240" selected>4 minutes (max)</option>
+        </select>
+      </div>
+    </div>
+    <div style="margin-top:12px;display:flex;align-items:center;gap:8px">
+      <input type="checkbox" id="add_title" checked style="width:auto"/>
+      <label for="add_title" style="text-transform:none;font-size:14px;color:var(--text)">Add title card intro</label>
+    </div>
+  </div>
+
+  <!-- Script card -->
+  <div class="card">
+    <h2>📝 Demo Narrative Script</h2>
+    <div class="tip" style="margin-bottom:16px">
+      <strong>💡 Script Format Tips</strong>
+      Use <code>## Scene Title</code> headings to separate scenes. Add optional directives on their own line:
+      <code>[action: scroll]</code> &nbsp; <code>[url: http://...]</code> &nbsp; <code>[target: .css-selector]</code>
+      <br>Or just paste plain text — each paragraph becomes a scene.
+    </div>
+    <div style="margin-bottom:10px;display:flex;gap:10px;align-items:center">
+      <label style="cursor:pointer;color:var(--accent);font-size:13px">
+        📎 Upload file (.txt/.md)
+        <input type="file" id="script_file" accept=".txt,.md" style="display:none" onchange="loadFile(this)"/>
+      </label>
+      <span style="color:var(--muted);font-size:12px" id="file-label"></span>
+      <button class="btn btn-secondary" style="padding:6px 14px;font-size:12px" onclick="loadSample()">Load Sample</button>
+    </div>
+    <textarea id="script" placeholder="## Introduction&#10;Welcome to our platform. Today I'll walk you through the key features.&#10;&#10;## Dashboard Overview&#10;[action: scroll]&#10;Here you can see the main dashboard with all your key metrics at a glance..."></textarea>
+  </div>
+
+  <!-- Action row -->
+  <div style="display:flex;gap:12px;align-items:center;margin-bottom:24px">
+    <button class="btn btn-primary" id="gen-btn" onclick="generate()">
+      <span id="btn-icon">🚀</span> Generate Demo Video
+    </button>
+    <button class="btn btn-secondary" onclick="resetForm()">Reset</button>
+    <span style="color:var(--muted);font-size:13px" id="hint"></span>
+  </div>
+
+  <!-- Progress card -->
+  <div class="card progress-card" id="progress-card">
+    <h2>⏳ Generating Video…</h2>
+    <div class="progress-bar-bg">
+      <div class="progress-bar-fill" id="prog-fill" style="width:0%"></div>
+    </div>
+    <div class="status-msg" id="status-msg">Starting…</div>
+    <div class="stats" id="stats" style="display:none">
+      <div class="stat"><div class="num" id="s-scenes">—</div><div class="lbl">Scenes</div></div>
+      <div class="stat"><div class="num" id="s-dur">—</div><div class="lbl">Duration</div></div>
+    </div>
+  </div>
+
+  <!-- Result card -->
+  <div class="card result-card" id="result-card">
+    <h2>✅ Video Ready!</h2>
+    <div class="stats">
+      <div class="stat"><div class="num" id="r-scenes">—</div><div class="lbl">Scenes</div></div>
+      <div class="stat"><div class="num" id="r-dur">—</div><div class="lbl">Duration</div></div>
+    </div>
+    <div class="video-wrap">
+      <video id="preview-video" controls></video>
+    </div>
+    <div class="dl-row">
+      <a id="dl-link" class="btn btn-primary" download>⬇️ Download MP4</a>
+      <button class="btn btn-secondary" onclick="resetForm()">🔄 Make Another</button>
+    </div>
+  </div>
+
+</div>
+
+<script>
+let currentJobId = null;
+let pollTimer = null;
+let allVoices = [];
+
+// ── Load voices ─────────────────────────────────────────────────────────────
+async function loadVoices() {
+  try {
+    const r = await fetch('/api/voices');
+    allVoices = await r.json();
+    renderVoices(allVoices);
+  } catch(e) {
+    renderVoices([
+      {ShortName:'en-US-AriaNeural',Gender:'Female',Locale:'en-US'},
+      {ShortName:'en-US-GuyNeural',Gender:'Male',Locale:'en-US'},
+      {ShortName:'en-GB-SoniaNeural',Gender:'Female',Locale:'en-GB'},
+    ]);
+  }
+}
+
+function renderVoices(list) {
+  const sel = document.getElementById('voice');
+  sel.innerHTML = list.map(v =>
+    `<option value="${v.ShortName}">${v.ShortName} (${v.Gender}, ${v.Locale})</option>`
+  ).join('');
+}
+
+function filterVoices(q) {
+  q = q.toLowerCase();
+  renderVoices(q ? allVoices.filter(v =>
+    v.ShortName.toLowerCase().includes(q) || v.Locale.toLowerCase().includes(q)
+  ) : allVoices);
+}
+
+// ── Sample script ────────────────────────────────────────────────────────────
+function loadSample() {
+  document.getElementById('script').value = `---
+title: Platform Demo
+---
+
+## Welcome
+Welcome to our next-generation platform. I'm going to walk you through everything you need to know to get started quickly and efficiently.
+
+## Dashboard Overview
+[action: scroll]
+Here on the main dashboard, you can see all your key metrics and performance indicators at a single glance. The intuitive layout puts the most important data right in front of you.
+
+## Key Features
+[action: scroll]
+Let me highlight the core features that make our platform stand out. Each module is designed to streamline your workflow and boost your team's productivity.
+
+## Getting Started
+Now let's see how easy it is to jump in and start using the platform. The onboarding experience is smooth and takes only minutes to complete.`;
+  document.getElementById('hint').textContent = 'Sample loaded – edit as needed';
+}
+
+function loadFile(input) {
+  const file = input.files[0];
+  if (!file) return;
+  document.getElementById('file-label').textContent = file.name;
+  const reader = new FileReader();
+  reader.onload = e => document.getElementById('script').value = e.target.result;
+  reader.readAsText(file);
+}
+
+// ── Generate ─────────────────────────────────────────────────────────────────
+async function generate() {
+  const script   = document.getElementById('script').value.trim();
+  const app_url  = document.getElementById('app_url').value.trim();
+  const voice    = document.getElementById('voice').value;
+  const res      = document.getElementById('resolution').value;
+  const maxDur   = document.getElementById('max_duration').value;
+  const addTitle = document.getElementById('add_title').checked;
+
+  if (!script)   return alert('Please enter a demo script.');
+  if (!app_url)  return alert('Please enter the app URL.');
+
+  const fd = new FormData();
+  fd.append('script', script);
+  fd.append('app_url', app_url);
+  fd.append('voice', voice);
+  fd.append('resolution', res);
+  fd.append('max_duration', maxDur);
+  fd.append('add_title', addTitle);
+
+  const scriptFile = document.getElementById('script_file').files[0];
+  if (scriptFile) fd.append('script_file', scriptFile);
+
+  setGenerating(true);
+  showProgress('Submitting job…', 2);
+
+  try {
+    const r = await fetch('/api/generate', {method:'POST', body:fd});
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || 'Server error');
+    currentJobId = data.job_id;
+    poll();
+  } catch(e) {
+    showError(e.message);
+    setGenerating(false);
+  }
+}
+
+function poll() {
+  if (!currentJobId) return;
+  pollTimer = setInterval(async () => {
+    try {
+      const r = await fetch(`/api/status/${currentJobId}`);
+      const job = await r.json();
+      updateProgress(job);
+      if (job.status === 'completed') {
+        clearInterval(pollTimer);
+        showResult(job);
+        setGenerating(false);
+      } else if (job.status === 'failed') {
+        clearInterval(pollTimer);
+        showError(job.error || job.message);
+        setGenerating(false);
+      }
+    } catch(e) { /* network hiccup - keep polling */ }
+  }, 1500);
+}
+
+function updateProgress(job) {
+  document.getElementById('prog-fill').style.width = job.progress + '%';
+  const msg = document.getElementById('status-msg');
+  msg.textContent = job.message;
+  msg.className = 'status-msg';
+  if (job.total_scenes) {
+    document.getElementById('s-scenes').textContent = job.total_scenes;
+    document.getElementById('s-dur').textContent = job.duration_s ? job.duration_s + 's' : '—';
+    document.getElementById('stats').style.display = 'flex';
+  }
+}
+
+function showProgress(msg, pct) {
+  document.getElementById('progress-card').classList.add('active');
+  document.getElementById('result-card').classList.remove('active');
+  document.getElementById('prog-fill').style.width = (pct||0) + '%';
+  document.getElementById('status-msg').textContent = msg;
+}
+
+function showResult(job) {
+  document.getElementById('progress-card').classList.remove('active');
+  const rc = document.getElementById('result-card');
+  rc.classList.add('active');
+  document.getElementById('r-scenes').textContent = job.total_scenes || '—';
+  document.getElementById('r-dur').textContent = job.duration_s ? job.duration_s + 's' : '—';
+  const dlLink = document.getElementById('dl-link');
+  dlLink.href = job.output_url;
+  dlLink.download = job.filename || 'demo.mp4';
+  const vid = document.getElementById('preview-video');
+  vid.src = job.output_url;
+  vid.load();
+  rc.scrollIntoView({behavior:'smooth'});
+}
+
+function showError(msg) {
+  document.getElementById('progress-card').classList.add('active');
+  document.getElementById('prog-fill').style.width = '0%';
+  const el = document.getElementById('status-msg');
+  el.textContent = '❌ ' + msg;
+  el.className = 'status-msg error';
+}
+
+function setGenerating(on) {
+  const btn = document.getElementById('gen-btn');
+  const icon = document.getElementById('btn-icon');
+  btn.disabled = on;
+  icon.innerHTML = on ? '<span class="spinner"></span>' : '🚀';
+  btn.childNodes[1].textContent = on ? ' Generating…' : ' Generate Demo Video';
+}
+
+function resetForm() {
+  if (pollTimer) clearInterval(pollTimer);
+  currentJobId = null;
+  document.getElementById('progress-card').classList.remove('active');
+  document.getElementById('result-card').classList.remove('active');
+  document.getElementById('prog-fill').style.width = '0%';
+  document.getElementById('stats').style.display = 'none';
+  setGenerating(false);
+  document.getElementById('hint').textContent = '';
+}
+
+loadVoices();
+</script>
+</body>
+</html>

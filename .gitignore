@@ -1,0 +1,10 @@
+app/.venv/
+app/bin/
+app/temp/
+app/output/
+**/__pycache__/
+*.pyc
+.DS_Store
+*.mp4
+*.mp3
+*.png

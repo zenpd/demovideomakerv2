@@ -1,0 +1,12 @@
+app/.venv/
+app/bin/
+app/temp/
+app/output/
+app/__pycache__/
+app/services/__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+.DS_Store
