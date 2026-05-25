@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  demo-maker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: demo-video-maker
+    ports:
+      - "8899:8899"
+    volumes:
+      - ./app/output:/app/output
+      - ./app/temp:/app/temp
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+    restart: unless-stopped

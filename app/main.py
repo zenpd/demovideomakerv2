@@ -170,11 +170,11 @@ async def _run_job(job_id, script, app_url, voice, max_duration, resolution, add
         jobs[job_id].update({"total_scenes": len(scenes), "duration_s": round(total_dur, 1)})
         _upd(job_id, 40, f"Narration: {total_dur:.0f}s across {len(scenes)} scenes")
 
-        # 4. Browser screenshots
+        # 4. Browser recordings (live video capture)
         _upd(job_id, 42, "Launching headless browser…")
         cap = BrowserCapture(width=w, height=h)
         for i, scene in enumerate(scenes):
-            shots = await cap.capture_scene(
+            video_path = await cap.capture_scene(
                 url=scene.get("url") or app_url,
                 action=scene.get("action", "navigate"),
                 target=scene.get("target", ""),
@@ -182,9 +182,9 @@ async def _run_job(job_id, script, app_url, voice, max_duration, resolution, add
                 output_dir=str(job_dir),
                 scene_index=i,
             )
-            scene["screenshots"] = shots
+            scene["video_path"] = video_path
             _upd(job_id, 42 + int(28 * (i + 1) / len(scenes)),
-                 f"Screenshots scene {i+1}/{len(scenes)}")
+                 f"Recorded scene {i+1}/{len(scenes)}")
 
         # 5. Assemble video
         _upd(job_id, 72, "Assembling video (FFmpeg)…")

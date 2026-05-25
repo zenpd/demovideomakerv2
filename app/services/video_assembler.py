@@ -1,11 +1,13 @@
 """
-Video Assembler – screenshots + TTS audio → polished MP4 via FFmpeg.
+Video Assembler – live browser recordings + TTS audio → polished MP4 via FFmpeg.
 
-v2 Fixes:
-  • Audio concat fixed: filter_complex concat (not -c copy) → full audio
-  • Title card: animated gradient, title fade-in, accent bars per-frame
-  • Annotation: rich lower-third, narration captions, gradient progress bar
-  • Ken Burns: aresample normalises audio before encode
+Pipeline per scene:
+  1. Trim/pad the recorded .webm to exactly match TTS audio duration
+  2. Replace browser's silent audio track with TTS narration
+  3. Burn rich lower-third overlay (title + caption + progress bar) via FFmpeg drawtext
+  4. Concat all scene clips + optional animated title card → final MP4
+
+v3: Uses live Playwright video recordings instead of static screenshots.
 """
 import asyncio
 import logging
@@ -16,6 +18,365 @@ import subprocess
 import textwrap
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+_APP_DIR = Path(__file__).parent.parent
+_FFMPEG  = str(_APP_DIR / "bin" / "ffmpeg")  if (_APP_DIR / "bin" / "ffmpeg").exists()  else "ffmpeg"
+_FFPROBE = str(_APP_DIR / "bin" / "ffprobe") if (_APP_DIR / "bin" / "ffprobe").exists() else "ffprobe"
+
+_FPS = 24
+
+# Colour palette (hex for FFmpeg drawtext)
+_DARK_BG  = "0x080e28"
+_ACCENT   = "0x3882f6"
+_ACCENT2  = "0x8b5cf6"
+_TEXT_HI  = "0xf0f5ff"
+_TEXT_LO  = "0xa0b4dc"
+
+_FONT_CANDIDATES = [
+    "/System/Library/Fonts/Helvetica.ttc",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+]
+_BOLD_CANDIDATES = [
+    "/System/Library/Fonts/Helvetica.ttc",
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+]
+
+
+def _find_font(bold: bool = False) -> str:
+    for p in (_BOLD_CANDIDATES if bold else _FONT_CANDIDATES):
+        if os.path.exists(p):
+            return p
+    return ""
+
+
+class VideoAssembler:
+    def __init__(self, fps: int = _FPS):
+        self.fps = fps
+
+    async def assemble(
+        self,
+        scenes: List[Dict[str, Any]],
+        output_path: str,
+        resolution: Tuple[int, int] = (1280, 720),
+        demo_title: Optional[str] = None,
+    ) -> bool:
+        if not scenes:
+            return False
+
+        work_dir = os.path.dirname(os.path.abspath(output_path))
+        w, h = resolution
+        loop = asyncio.get_event_loop()
+        clip_paths: List[str] = []
+
+        # Optional animated intro title card
+        if demo_title:
+            intro = os.path.join(work_dir, "clip_intro.mp4")
+            ok = await loop.run_in_executor(None, _title_card, demo_title, intro, w, h, self.fps)
+            if ok and os.path.exists(intro):
+                clip_paths.append(intro)
+
+        # Per-scene clips: trim video + replace audio + burn overlay
+        for i, scene in enumerate(scenes):
+            clip = os.path.join(work_dir, f"clip_{i:03d}.mp4")
+            ok = await loop.run_in_executor(
+                None, _scene_clip, scene, clip, w, h, self.fps, i, len(scenes)
+            )
+            if ok and os.path.exists(clip):
+                clip_paths.append(clip)
+            else:
+                logger.warning("Scene %d clip failed – skipping", i)
+
+        if not clip_paths:
+            return False
+
+        return await loop.run_in_executor(
+            None, _concat_reencode, clip_paths, output_path, work_dir, w, h, self.fps
+        )
+
+
+# ── Scene clip ────────────────────────────────────────────────────────────────
+
+def _scene_clip(
+    scene: Dict, output: str, w: int, h: int, fps: int, idx: int, total: int
+) -> bool:
+    video = scene.get("video_path", "")
+    audio = scene.get("audio_path", "")
+    dur   = float(scene.get("duration", 5.0))
+    title = scene.get("title", f"Scene {idx + 1}")
+    narration = scene.get("narration", "")
+
+    if not audio or not os.path.exists(audio):
+        logger.error("Missing audio for scene %d: %s", idx, audio)
+        return False
+
+    caption_lines = _wrap_caption(narration, 80)
+    cap_fs   = max(13, h // 52)
+    title_fs = max(18, h // 34)
+    band_h   = title_fs + (cap_fs + 4) * max(len(caption_lines), 1) + 28
+    bar_y    = h - band_h - 6
+    text_y   = h - band_h + 10
+    cap_y    = h - band_h + 12 + title_fs
+    pb_w     = max(1, int(w * (idx + 1) / total))
+    badge    = f"{idx + 1}/{total}"
+
+    font      = _find_font(bold=False)
+    font_bold = _find_font(bold=True)
+    font_arg      = f":fontfile={font}"      if font      else ""
+    font_bold_arg = f":fontfile={font_bold}" if font_bold else ""
+
+    # ── Pass 1: Combine video + audio into intermediate MP4 ──────────────────
+    pass1 = output + ".p1.mp4"
+    scale_vf = (
+        f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={fps}"
+    )
+
+    if video and os.path.exists(video):
+        cmd1 = [
+            _FFMPEG, "-y",
+            "-i", video,
+            "-i", audio,
+            "-vf", scale_vf,
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "44100",
+            "-pix_fmt", "yuv420p",
+            "-t", str(dur + 0.1),
+            "-shortest",
+            pass1,
+        ]
+    else:
+        logger.warning("Scene %d: no video recording – using colour card", idx)
+        cmd1 = [
+            _FFMPEG, "-y",
+            "-f", "lavfi", "-i", f"color=c=0x0a0f2a:s={w}x{h}:r={fps}",
+            "-i", audio,
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "44100",
+            "-pix_fmt", "yuv420p",
+            "-t", str(dur + 0.1),
+            "-shortest",
+            pass1,
+        ]
+
+    if not _run(cmd1, timeout=300):
+        logger.error("Scene %d pass-1 (video+audio) failed", idx)
+        return False
+
+    # ── Pass 2: Burn overlay via -vf (textfile= avoids all escaping issues) ──
+    title_file = output + ".title.txt"
+    cap_file   = output + ".cap.txt"
+    try:
+        with open(title_file, "w", encoding="utf-8") as f:
+            f.write(title)
+        cap_text = "  ".join(caption_lines)
+        with open(cap_file, "w", encoding="utf-8") as f:
+            f.write(cap_text)
+    except Exception as e:
+        logger.error("Could not write text temp files: %s", e)
+        shutil.move(pass1, output)
+        return True  # Return pass-1 without overlay rather than failing
+
+    vf_parts = [
+        # Dark band at bottom
+        f"drawbox=x=0:y={h - band_h}:w={w}:h={band_h}:color=0x080c26@0.88:t=fill",
+        # Top gradient accent bars
+        f"drawbox=x=0:y={h - band_h}:w={w // 2}:h=4:color=0x3882f6:t=fill",
+        f"drawbox=x={w // 2}:y={h - band_h}:w={w // 2}:h=4:color=0x8b5cf6:t=fill",
+        # Progress bar background + fill
+        f"drawbox=x=0:y={bar_y}:w={w}:h=5:color=0x141430@0.85:t=fill",
+        f"drawbox=x=0:y={bar_y}:w={pb_w}:h=5:color=0x3882f6:t=fill",
+        # Scene title (textfile to avoid escaping issues)
+        f"drawtext=textfile={title_file}:x=18:y={text_y}"
+        f":fontsize={title_fs}:fontcolor=0xf0f5ff{font_bold_arg}"
+        f":shadowx=2:shadowy=2:shadowcolor=0x000000@0.6",
+        # Caption (textfile)
+        f"drawtext=textfile={cap_file}:x=18:y={cap_y}"
+        f":fontsize={cap_fs}:fontcolor=0xa0b4dc{font_arg}",
+        # Scene badge top-right
+        f"drawbox=x={w - 120}:y=10:w=112:h=30:color=0x080e28@0.80:t=fill",
+        f"drawtext=text={badge}:x={w - 110}:y=18"
+        f":fontsize={max(13, h // 50)}:fontcolor=0xf0f5ff{font_arg}",
+    ]
+    vf = ",".join(vf_parts)
+
+    cmd2 = [
+        _FFMPEG, "-y",
+        "-i", pass1,
+        "-vf", vf,
+        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+        "-c:a", "copy",
+        "-pix_fmt", "yuv420p",
+        output,
+    ]
+    ok = _run(cmd2, timeout=300)
+
+    # Cleanup temp files
+    for f in [pass1, title_file, cap_file]:
+        try:
+            os.unlink(f)
+        except Exception:
+            pass
+
+    if not ok:
+        logger.error("Scene %d pass-2 (overlay) failed – using pass-1 output", idx)
+        # Fallback: use the pass-1 clip without overlay
+        if os.path.exists(pass1):
+            shutil.move(pass1, output)
+            return True
+        return False
+
+    return True
+
+
+# ── Title card ────────────────────────────────────────────────────────────────
+
+def _title_card(title: str, output: str, w: int, h: int, fps: int) -> bool:
+    """4-second animated title card using FFmpeg -vf drawtext with textfile."""
+    font_bold = _find_font(bold=True)
+    font      = _find_font(bold=False)
+    font_bold_arg = f":fontfile={font_bold}" if font_bold else ""
+    font_arg      = f":fontfile={font}"      if font      else ""
+
+    title_fs  = max(52, w // 14)
+    sub_fs    = max(24, w // 34)
+
+    # Write title text to file to avoid escaping issues
+    title_file   = output + ".title.txt"
+    tagline_file = output + ".tagline.txt"
+    try:
+        with open(title_file, "w", encoding="utf-8") as f:
+            f.write(title)
+        with open(tagline_file, "w", encoding="utf-8") as f:
+            f.write("Demo Walkthrough")
+    except Exception as e:
+        logger.error("Could not write title text files: %s", e)
+
+    # Animated overlays using expressions (t = current time in seconds)
+    vf_parts = [
+        # Title text: fades in over first 0.5s
+        f"drawtext=textfile={title_file}:x=(w-tw)/2:y=(h-th)/2"
+        f":fontsize={title_fs}:fontcolor=0xf0f5ff{font_bold_arg}"
+        f":alpha='min(t*2\\,1.0)':shadowx=3:shadowy=3:shadowcolor=0x000000@0.5",
+        # Tagline: delayed fade-in starting at 0.4s
+        f"drawtext=textfile={tagline_file}:x=(w-tw)/2:y=(h+th)/2+24"
+        f":fontsize={sub_fs}:fontcolor=0x3882f6{font_arg}"
+        f":alpha='max(0\\,min((t-0.4)*2.5\\,1.0))'",
+        # Bottom accent bar (grows across screen over 2s)
+        f"drawbox=x=0:y={h - 6}:w='min(t/2\\,1)*{w}':h=6:color=0x8b5cf6:t=fill",
+        # Top accent bar under title
+        f"drawbox=x='(iw-min(t*{w}\\,{w // 2}))/2':y={(h // 2) - (title_fs // 2) - 20}"
+        f":w='min(t*{w}\\,{w // 2})':h=4:color=0x3882f6:t=fill",
+    ]
+    vf = ",".join(vf_parts)
+
+    cmd = [
+        _FFMPEG, "-y",
+        "-f", "lavfi", "-i", f"color=c=0x080e28:s={w}x{h}:r={fps}",
+        "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+        "-vf", vf,
+        "-map", "0:v", "-map", "1:a",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+        "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+        "-pix_fmt", "yuv420p",
+        "-t", "4",
+        output,
+    ]
+    ok = _run(cmd, timeout=120)
+
+    for f in [title_file, tagline_file]:
+        try:
+            os.unlink(f)
+        except Exception:
+            pass
+
+    if not ok:
+        logger.warning("Animated title card failed – using plain colour fallback")
+        cmd2 = [
+            _FFMPEG, "-y",
+            "-f", "lavfi", "-i", f"color=c=0x080e28:s={w}x{h}:r={fps}",
+            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+            "-map", "0:v", "-map", "1:a",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+            "-pix_fmt", "yuv420p",
+            "-t", "4",
+            output,
+        ]
+        return _run(cmd2, timeout=60)
+    return True
+
+
+# ── Concat ────────────────────────────────────────────────────────────────────
+
+def _concat_reencode(
+    clips: List[str], output: str, work_dir: str, w: int, h: int, fps: int
+) -> bool:
+    if len(clips) == 1:
+        shutil.copy2(clips[0], output)
+        return True
+
+    n = len(clips)
+    inputs: List[str] = []
+    for c in clips:
+        inputs += ["-i", c]
+
+    filter_complex = (
+        "".join(f"[{i}:v:0][{i}:a:0]" for i in range(n))
+        + f"concat=n={n}:v=1:a=1[vout][aout]"
+    )
+
+    cmd = [
+        _FFMPEG, "-y",
+        *inputs,
+        "-filter_complex", filter_complex,
+        "-map", "[vout]", "-map", "[aout]",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "21",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "44100",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        output,
+    ]
+    return _run(cmd, timeout=600)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _wrap_caption(text: str, max_chars: int = 80) -> List[str]:
+    text = re.sub(r'\s+', ' ', text).strip()
+    if not text:
+        return []
+    return textwrap.wrap(text, width=max_chars)[:2]
+
+
+def _esc(s: str) -> str:
+    """Escape text for FFmpeg drawtext filter."""
+    return s.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:").replace("%", "\\%")
+
+
+def _run(cmd: List[str], timeout: int = 120) -> bool:
+    logger.debug("FFmpeg: %s", " ".join(cmd))
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if r.returncode != 0:
+            logger.error("FFmpeg error: %s", r.stderr[-800:] if r.stderr else "")
+        return r.returncode == 0
+    except subprocess.TimeoutExpired:
+        logger.error("FFmpeg timed out (%ds)", timeout)
+        return False
+    except FileNotFoundError:
+        logger.error("ffmpeg not found at: %s", _FFMPEG)
+        return False
+
 
 logger = logging.getLogger(__name__)
 
