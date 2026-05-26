@@ -98,6 +98,7 @@ class BrowserCapture:
         output_dir: str,
         scene_index: int,
         text: str = "",
+        wait_for: str = "",
     ) -> Optional[str]:
         """
         Record the browser performing the specified action.
@@ -133,7 +134,7 @@ class BrowserCapture:
                 page = await ctx.new_page()
 
                 # ── Navigate with SPA-friendly strategy ───────────────────
-                await self._navigate(page, url, scene_index)
+                await self._navigate(page, url, scene_index, action=action)
 
                 # Inject cursor overlay
                 try:
@@ -144,7 +145,7 @@ class BrowserCapture:
 
                 # ── Perform action ────────────────────────────────────────
                 budget = max(duration - 1.8, 1.0)
-                await self._act(page, action, target, text, budget)
+                await self._act(page, action, target, text, budget, wait_for)
 
                 # Keep video reference before closing
                 video_obj = page.video
@@ -188,13 +189,17 @@ class BrowserCapture:
 
     # ── Navigation ────────────────────────────────────────────────────────────
 
-    async def _navigate(self, page, url: str, scene_index: int):
+    async def _navigate(self, page, url: str, scene_index: int, action: str = "navigate"):
         """
         SPA-friendly navigation strategy:
         1. Try networkidle (best quality, may timeout on SPAs with polling)
         2. Fall back to load event
         3. Fall back to domcontentloaded + fixed wait
         Always scroll to top after navigation so recording starts from the top.
+
+        For 'click' action scenes, uses a short render wait (1.0s) so the
+        nav click happens immediately at scene start — no visible homepage flash.
+        For all other scenes, waits 3.5s for full SPA render.
         """
         for wait_until, timeout in [
             ("networkidle", 15000),
@@ -211,8 +216,10 @@ class BrowserCapture:
             logger.warning("Scene %d: all navigation strategies failed for %s",
                            scene_index, url)
 
-        # Give React/Vue/Angular time to fully render after route mount
-        await asyncio.sleep(2.0)
+        # For click scenes: short wait so we jump straight to the nav click.
+        # For navigate/scroll/wait scenes: full 3.5s to let SPA fully render.
+        render_wait = 2.5 if action == "click" else 3.5
+        await asyncio.sleep(render_wait)
 
         # Scroll to top so the scene always starts from the beginning of the page
         try:
@@ -223,11 +230,11 @@ class BrowserCapture:
 
     # ── Action dispatcher ─────────────────────────────────────────────────────
 
-    async def _act(self, page, action: str, target: str, text: str, budget: float):
+    async def _act(self, page, action: str, target: str, text: str, budget: float, wait_for: str = ""):
         if action == "scroll":
             await self._scroll(page, target, budget)
         elif action == "click":
-            await self._click(page, target, budget)
+            await self._click(page, target, budget, wait_for)
         elif action == "type":
             await self._type(page, target, text, budget)
         elif action == "hover":
@@ -235,6 +242,52 @@ class BrowserCapture:
         else:
             # navigate / wait – display cursor and let page sit
             await self._idle(page, budget)
+
+    # ── Resilient locator resolver ────────────────────────────────────────────
+
+    async def _resolve_locator(self, page, target: str, timeout: int = 8000):
+        """
+        Try multiple selector strategies for a target string and return the
+        first locator whose element is visible on the page.
+
+        Strategy order:
+          1. target as-is  (CSS, data-testid, role=…, XPath, or existing text=…)
+          2. Playwright text selector  text=<target>  (case-sensitive)
+          3. Case-insensitive text regex  text=/<target>/i
+          4. :has-text("<target>")  (partial substring match, case-insensitive)
+          5. [aria-label*="<target>" i]  (ARIA label contains, case-insensitive)
+        """
+        # Strip surrounding quotes if the caller passed e.g. "Analytics"
+        bare = target.strip('"\'')
+
+        # Also strip a leading "text=" prefix so we can build variants from the label
+        if bare.lower().startswith("text="):
+            bare = bare[5:].strip()
+
+        # Build the candidate list, always including the original plus all variants
+        candidates = [target]
+        # Add fallback variants regardless of what prefix the original had
+        variants = [
+            f"text={bare}",
+            f"text=/{bare}/i",
+            f":has-text(\"{bare}\")",
+            f"[aria-label*=\"{bare}\" i]",
+        ]
+        for v in variants:
+            if v != target:
+                candidates.append(v)
+
+        for sel in candidates:
+            try:
+                loc = page.locator(sel).first
+                await loc.wait_for(state="visible", timeout=timeout)
+                logger.debug("Resolved selector '%s' → '%s'", target, sel)
+                return loc
+            except Exception:
+                continue
+
+        logger.warning("_resolve_locator: no visible element found for '%s'", target)
+        return None
 
     # ── Individual actions ────────────────────────────────────────────────────
 
@@ -299,41 +352,69 @@ class BrowserCapture:
             await asyncio.sleep(budget)
             return
 
-        await self._slow_scroll(page, cx, cy, budget, distance=max_scroll * 0.75)
+        await self._slow_scroll(page, cx, cy, budget, distance=max_scroll * 1.0)
 
     async def _slow_scroll(self, page, cx: float, cy: float,
                            budget: float, distance: float = 0):
-        """Distribute scroll distance evenly over budget with cursor movement."""
+        """
+        Scroll in a pause-read-scroll pattern that follows the audio narration:
+          - Divide the page into thirds
+          - Scroll to each third, then pause so the audience can absorb the content
+          - This keeps the visible content in sync with what the narrator is saying
+        """
         if distance == 0:
             try:
                 metrics = await page.evaluate(
                     "() => ({sh: document.body.scrollHeight, ih: window.innerHeight})"
                 )
-                distance = max(metrics["sh"] - metrics["ih"], 400) * 0.75
+                distance = max(metrics["sh"] - metrics["ih"], 400) * 1.0
             except Exception:
                 distance = 600
 
-        steps = max(int(budget / 0.4), 6)
-        px_per_step = distance / steps
-        interval = budget / steps
+        # Split budget: 15% intro hold at top, 85% for actual scrolling
+        intro_hold = budget * 0.15
+        scroll_budget = budget - intro_hold
 
-        for i in range(steps):
-            try:
-                await page.evaluate(
-                    f"window.scrollBy({{top:{px_per_step:.0f},behavior:'smooth'}})"
-                )
-                nx = cx + (i % 3 - 1) * 25
-                ny = cy - i * 4
-                await page.evaluate(f"window.__dv_move && window.__dv_move({nx},{ny})")
-            except Exception:
-                pass
-            await asyncio.sleep(interval)
+        # Hold at top briefly so audience sees the section heading first
+        await asyncio.sleep(intro_hold)
 
-    async def _click(self, page, target: str, budget: float):
+        # Divide page into 3 sections; pause between each so audio can catch up
+        sections = 3
+        section_distance = distance / sections
+        # Each section: 60% scrolling time, 40% pause time
+        section_budget = scroll_budget / sections
+        scroll_time_per_section = section_budget * 0.60
+        pause_time_per_section  = section_budget * 0.40
+
+        for section in range(sections):
+            # Scroll through this section smoothly
+            steps = max(int(scroll_time_per_section / 0.35), 4)
+            px_per_step = section_distance / steps
+            interval = scroll_time_per_section / steps
+
+            for i in range(steps):
+                try:
+                    await page.evaluate(
+                        f"window.scrollBy({{top:{px_per_step:.0f},behavior:'smooth'}})"
+                    )
+                    nx = cx + (i % 3 - 1) * 20
+                    ny = cy
+                    await page.evaluate(f"window.__dv_move && window.__dv_move({nx},{ny})")
+                except Exception:
+                    pass
+                await asyncio.sleep(interval)
+
+            # Pause at this section so audience reads/hears the content
+            # (skip final pause to not over-extend last section)
+            if section < sections - 1:
+                await asyncio.sleep(pause_time_per_section)
+
+    async def _click(self, page, target: str, budget: float, wait_for: str = ""):
         """
         Move cursor to element → ripple → click → wait for result.
         After the click, scroll slowly to reveal whatever was loaded/changed.
         Falls back to idle + scroll if target is missing or not found.
+        If wait_for is provided, waits for that selector before starting scroll.
         """
         if not target:
             await self._idle_then_scroll(page, budget)
@@ -341,52 +422,60 @@ class BrowserCapture:
 
         clicked = False
         try:
-            # Wait for element to appear on page (SPA nav items may load async)
-            await page.locator(target).first.wait_for(state="visible", timeout=8000)
-            await asyncio.sleep(0.3)
+            loc = await self._resolve_locator(page, target, timeout=10000)
+            if loc is None:
+                logger.warning("Click: no element matched '%s', falling back", target)
+            else:
+                await loc.scroll_into_view_if_needed(timeout=4000)
+                await asyncio.sleep(0.4)
 
-            await page.locator(target).first.scroll_into_view_if_needed(timeout=4000)
-            await asyncio.sleep(0.4)
+                bbox = await loc.bounding_box()
+                if bbox:
+                    cx = bbox["x"] + bbox["width"]  / 2
+                    cy = bbox["y"] + bbox["height"] / 2
 
-            bbox = await page.locator(target).first.bounding_box()
-            if bbox:
-                cx = bbox["x"] + bbox["width"]  / 2
-                cy = bbox["y"] + bbox["height"] / 2
+                    # Show cursor approaching the button
+                    await page.evaluate(f"window.__dv_show && window.__dv_show({cx},{cy})")
+                    await asyncio.sleep(0.5)
 
-                # Show cursor approaching the button
-                await page.evaluate(f"window.__dv_show && window.__dv_show({cx},{cy})")
-                await asyncio.sleep(0.5)
+                    # Ripple → click
+                    await page.evaluate(f"window.__dv_ripple && window.__dv_ripple({cx},{cy})")
+                    await asyncio.sleep(0.15)
+                    await loc.click(timeout=5000)
+                    clicked = True
 
-                # Ripple → click
-                await page.evaluate(f"window.__dv_ripple && window.__dv_ripple({cx},{cy})")
-                await asyncio.sleep(0.15)
-                await page.locator(target).first.click(timeout=5000)
-                clicked = True
-
-                # Wait for navigation or async results (AI agents, API calls, etc.)
-                # Allow up to 10 seconds for the page to settle after click
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=10000)
-                except Exception:
+                    # Wait for navigation or async results (AI agents, API calls, etc.)
+                    # Allow up to 10 seconds for the page to settle after click
                     try:
-                        await page.wait_for_load_state("load", timeout=5000)
+                        await page.wait_for_load_state("networkidle", timeout=10000)
+                    except Exception:
+                        try:
+                            await page.wait_for_load_state("load", timeout=5000)
+                        except Exception:
+                            pass
+
+                    # If wait_for selector provided, wait for it to appear (pauses timeline)
+                    if wait_for:
+                        try:
+                            await page.locator(wait_for).first.wait_for(state="visible", timeout=8000)
+                            logger.debug("wait_for selector visible: %s", wait_for)
+                        except Exception as e:
+                            logger.warning("wait_for failed '%s': %s", wait_for, e)
+
+                    # Give JS/animations time to render results on screen (extended to 4s)
+                    await asyncio.sleep(4.0)
+
+                    # Re-inject cursor (SPA re-renders may destroy it)
+                    try:
+                        await page.evaluate(_CURSOR_JS)
                     except Exception:
                         pass
 
-                # Give JS/animations time to render results on screen
-                await asyncio.sleep(2.0)
-
-                # Re-inject cursor (SPA re-renders may destroy it)
-                try:
-                    await page.evaluate(_CURSOR_JS)
-                except Exception:
-                    pass
-
-                # Scroll slowly through the results for the remainder of the budget
-                used = 1.0 + 0.5 + 0.15 + 2.0   # rough time already spent
-                remaining = max(budget - used, 1.0)
-                await self._slow_scroll(page, self.width // 2, self.height // 2,
-                                        remaining)
+                    # Scroll slowly through the results for the remainder of the budget
+                    used = 1.0 + 0.5 + 0.15 + 4.0   # rough time already spent
+                    remaining = max(budget - used, 1.0)
+                    await self._slow_scroll(page, self.width // 2, self.height // 2,
+                                            remaining)
         except Exception as e:
             logger.warning("Click action failed '%s': %s", target, e)
 
@@ -410,17 +499,19 @@ class BrowserCapture:
         type_text = text.strip() if text.strip() else "Demo text"
         try:
             if target:
-                await page.locator(target).first.scroll_into_view_if_needed(timeout=4000)
-                bbox = await page.locator(target).first.bounding_box()
-                if bbox:
-                    cx = bbox["x"] + bbox["width"]  / 2
-                    cy = bbox["y"] + bbox["height"] / 2
-                    await page.evaluate(f"window.__dv_show && window.__dv_show({cx},{cy})")
-                    await asyncio.sleep(0.35)
-                    await page.evaluate(f"window.__dv_ripple && window.__dv_ripple({cx},{cy})")
-                    await asyncio.sleep(0.1)
-                await page.locator(target).first.click(timeout=5000)
-                await asyncio.sleep(0.25)
+                loc = await self._resolve_locator(page, target, timeout=8000)
+                if loc:
+                    await loc.scroll_into_view_if_needed(timeout=4000)
+                    bbox = await loc.bounding_box()
+                    if bbox:
+                        cx = bbox["x"] + bbox["width"]  / 2
+                        cy = bbox["y"] + bbox["height"] / 2
+                        await page.evaluate(f"window.__dv_show && window.__dv_show({cx},{cy})")
+                        await asyncio.sleep(0.35)
+                        await page.evaluate(f"window.__dv_ripple && window.__dv_ripple({cx},{cy})")
+                        await asyncio.sleep(0.1)
+                    await loc.click(timeout=5000)
+                    await asyncio.sleep(0.25)
 
             # Natural typing: use 60% of budget for key presses
             type_budget = budget * 0.60
@@ -438,14 +529,16 @@ class BrowserCapture:
             await self._idle(page, budget)
             return
         try:
-            await page.locator(target).first.scroll_into_view_if_needed(timeout=4000)
-            bbox = await page.locator(target).first.bounding_box()
-            if bbox:
-                cx = bbox["x"] + bbox["width"]  / 2
-                cy = bbox["y"] + bbox["height"] / 2
-                await page.evaluate(f"window.__dv_show && window.__dv_show({cx},{cy})")
-                await asyncio.sleep(0.4)
-                await page.locator(target).first.hover(timeout=5000)
+            loc = await self._resolve_locator(page, target, timeout=8000)
+            if loc:
+                await loc.scroll_into_view_if_needed(timeout=4000)
+                bbox = await loc.bounding_box()
+                if bbox:
+                    cx = bbox["x"] + bbox["width"]  / 2
+                    cy = bbox["y"] + bbox["height"] / 2
+                    await page.evaluate(f"window.__dv_show && window.__dv_show({cx},{cy})")
+                    await asyncio.sleep(0.4)
+                    await loc.hover(timeout=5000)
             await asyncio.sleep(budget)
         except Exception as e:
             logger.warning("Hover action failed '%s': %s", target, e)

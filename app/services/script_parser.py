@@ -9,8 +9,7 @@ Scene dict:
     "narration": str,
     "url": str | None,     # override app_url for this scene
     "action": str,         # "navigate" | "scroll" | "click" | "wait"
-    "target": str,         # CSS selector or empty
-  }
+    "target": str,         # CSS selector or empty    "wait_for": str,       # CSS selector to wait for before starting action  }
 
 Script format (simplest):
   ## Scene Title
@@ -101,6 +100,7 @@ class ScriptParser:
                 "action": directives.get("action", "navigate"),
                 "target": directives.get("target", ""),
                 "text":   directives.get("text", ""),
+                "wait_for": directives.get("wait_for", ""),
             }
             # Optional explicit duration (seconds). Overrides TTS length in main.py.
             if "duration" in directives:
