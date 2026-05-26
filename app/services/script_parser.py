@@ -93,14 +93,22 @@ class ScriptParser:
                 continue
 
             directives = dict(meta_lines)
-            scenes.append({
+            scene: Dict[str, Any] = {
                 "index": len(scenes),
                 "title": title,
                 "narration": narration,
                 "url": directives.get("url") or default_url or None,
                 "action": directives.get("action", "navigate"),
                 "target": directives.get("target", ""),
-            })
+                "text":   directives.get("text", ""),
+            }
+            # Optional explicit duration (seconds). Overrides TTS length in main.py.
+            if "duration" in directives:
+                try:
+                    scene["duration_override"] = float(directives["duration"])
+                except ValueError:
+                    pass
+            scenes.append(scene)
 
         return scenes
 
@@ -123,5 +131,6 @@ class ScriptParser:
                 "url": default_url or None,
                 "action": "navigate",
                 "target": "",
+                "text": "",
             })
         return scenes

@@ -153,9 +153,11 @@ async def _run_job(job_id, script, app_url, voice, max_duration, resolution, add
             audio_path = str(job_dir / f"audio_{i:03d}.mp3")
             dur = await tts.generate(scene["narration"], audio_path)
             scene["audio_path"] = audio_path
-            scene["duration"] = dur
+            # [duration: N] sets a minimum floor; TTS length always wins if longer
+            override = scene.pop("duration_override", None)
+            scene["duration"] = max(dur, override) if override else dur
             _upd(job_id, 10 + int(30 * (i + 1) / len(scenes)),
-                 f"Audio {i+1}/{len(scenes)} ({dur:.1f}s)")
+                 f"Audio {i+1}/{len(scenes)} ({scene['duration']:.1f}s)")
 
         # 3. Duration cap
         total_dur = sum(s["duration"] for s in scenes)
@@ -178,6 +180,7 @@ async def _run_job(job_id, script, app_url, voice, max_duration, resolution, add
                 url=scene.get("url") or app_url,
                 action=scene.get("action", "navigate"),
                 target=scene.get("target", ""),
+                text=scene.get("text", ""),
                 duration=scene["duration"],
                 output_dir=str(job_dir),
                 scene_index=i,

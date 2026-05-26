@@ -1,0 +1,23 @@
+00:00:00
+Every day, financial institutions move trillions of dollars across SWIFT, A C H, RTGS, and SEPA. Treasury teams rely on spreadsheets and static rules to route payments. That's slow, inconsistent, and costly. Choosing the wrong rail wastes thousands of dollars per transaction.
+
+00:00:18
+Meet the ZenLabs Payment Orchestration Platform, an agentic AI system that scores all payment rails, applies compliance rules, and selects the optimal route automatically. Supporting US, UK, South Africa, and Europe.
+
+00:00:33
+Let's run a live payment. We set up an amount of fifty thousand dollars, select the currency, Sender ID, and Receiver ID, then select the US to UK corridor and hit Orchestrate. Four AI agents activate instantly — Analyze Payment Parameters validates the request, Evaluate Payment fetches all eligible rails, Select optimal route picks the highest-scoring option, and Execute Payment submits the transaction and returns a confirmation ID. The user gets full visibility into transaction details and processing fees in real time. The entire workflow completes in few seconds.
+
+00:01:11
+The AI recommendation engine delivers transparent decision-making — comparing every rail across cost, speed, and reliability with a detailed score breakdown. Clients can see exactly why a rail was selected, along with estimated savings on every transaction. Every score is explainable in real time — giving your team full confidence in every AI-driven routing decision.
+
+00:01:34
+ACH scores eighty-one points — the highest composite score for this corridor. That's a saving of fourteen dollars and fifty cents over Wire Transfer, with every decision logged for complete audit trail compliance.
+
+00:01:49
+The Analytics Dashboard gives a real-time view of platform performance. Total orchestrations stand at two thousand eight hundred and forty seven, with an average speed score of eighty-seven point three, rail efficiency at ninety-four point two percent, and twelve thousand four hundred dollars saved through cost optimizations. The Payment Rail Usage section shows how transaction traffic is distributed across payment networks such as SWIFT GPI, Real-Time Payments, ACH Batch, and SEPA. It helps monitor which rails are most frequently used and provides insights into routing patterns, operational efficiency, and regional payment preferences. The Regional Distribution section visualizes transaction activity across the US, UK, South Africa, and Europe — showing exactly where volume flows and where savings are being generated.
+
+00:02:40
+The Agent Status module monitors AI agents responsible for different stages of the payment orchestration workflow. The Context Collector Agent gathers and enriches transaction data, the Policy Reasoner Agent performs compliance and regulatory validation, and the Optimizer Agent selects the best payment rail based on cost, speed, and reliability analysis. The dashboard also tracks each agent's uptime, health status, last activity check, and total tasks processed to ensure the entire orchestration system is operating efficiently.
+
+00:03:13
+This is AI-driven payment orchestration running live in production. Every routing decision, every rail evaluation, every dollar saved — happening in real time, automatically, at scale. If your team is still routing payments manually, the cost of waiting is already adding up. Let's build this for you.

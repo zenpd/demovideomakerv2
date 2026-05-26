@@ -1,17 +1,92 @@
 """
-Browser Capture: uses Playwright (async) to record a live browser video for each scene.
-Records actual UI interactions (scrolls, clicks, animations) and returns the video path.
+Browser Capture – Playwright live video recorder with visual interaction feedback.
+
+For each scene:
+  1. Navigate to the URL, wait for the SPA to fully render
+  2. Inject a visible cursor + click-ripple overlay via JavaScript
+  3. Perform the scene action (scroll / click / type / hover / navigate)
+     with smooth animations visible in the recording
+  4. Close context → Playwright saves the .webm recording
 """
-import asyncio, logging, os, shutil, tempfile
+import asyncio
+import logging
+import os
+import shutil
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# JavaScript injected into every recorded page.
+# Creates a floating red cursor dot and click-ripple effect.
+_CURSOR_JS = """
+() => {
+    if (document.getElementById('__dv_cur__')) return;
+
+    const style = document.createElement('style');
+    style.textContent = `
+        @keyframes __dv_ripple {
+            0%   { transform: translate(-50%,-50%) scale(0.2); opacity: 0.9; }
+            100% { transform: translate(-50%,-50%) scale(3);   opacity: 0;   }
+        }
+        @keyframes __dv_pulse {
+            0%,100% { box-shadow: 0 0 0 3px rgba(239,68,68,.35), 0 2px 8px rgba(0,0,0,.4); }
+            50%     { box-shadow: 0 0 0 7px rgba(239,68,68,.15), 0 2px 8px rgba(0,0,0,.4); }
+        }
+        #__dv_cur__ {
+            position: fixed;
+            width: 18px; height: 18px;
+            background: rgba(239,68,68,.92);
+            border: 2.5px solid white;
+            border-radius: 50%;
+            pointer-events: none;
+            z-index: 2147483647;
+            transform: translate(-50%,-50%);
+            transition: left .28s cubic-bezier(.4,0,.2,1),
+                        top  .28s cubic-bezier(.4,0,.2,1);
+            animation: __dv_pulse 1.6s ease-in-out infinite;
+            display: none;
+        }
+    `;
+    document.head.appendChild(style);
+
+    const cur = document.createElement('div');
+    cur.id = '__dv_cur__';
+    document.body.appendChild(cur);
+
+    window.__dv_show = (x, y) => {
+        cur.style.display = 'block';
+        cur.style.left = x + 'px';
+        cur.style.top  = y + 'px';
+    };
+
+    window.__dv_move = (x, y) => {
+        cur.style.left = x + 'px';
+        cur.style.top  = y + 'px';
+    };
+
+    window.__dv_ripple = (x, y) => {
+        const r = document.createElement('div');
+        r.style.cssText = [
+            'position:fixed', 'pointer-events:none',
+            `left:${x}px`, `top:${y}px`,
+            'width:46px', 'height:46px',
+            'background:rgba(239,68,68,.2)',
+            'border:2px solid rgba(239,68,68,.7)',
+            'border-radius:50%',
+            'z-index:2147483646',
+            'animation:__dv_ripple .55s ease-out forwards',
+        ].join(';');
+        document.body.appendChild(r);
+        setTimeout(() => r && r.remove(), 650);
+    };
+}
+"""
+
 
 class BrowserCapture:
     def __init__(self, width: int = 1280, height: int = 720):
-        self.width = width
+        self.width  = width
         self.height = height
 
     async def capture_scene(
@@ -22,15 +97,16 @@ class BrowserCapture:
         duration: float,
         output_dir: str,
         scene_index: int,
+        text: str = "",
     ) -> Optional[str]:
         """
-        Navigate to url, perform action while recording the browser as a video.
-        Returns path to the recorded .webm video file, or None on failure.
+        Record the browser performing the specified action.
+        Returns path to the .webm file, or None on failure.
         """
         try:
             from playwright.async_api import async_playwright
         except ImportError:
-            logger.error("playwright not installed – run: pip install playwright && playwright install chromium")
+            logger.error("playwright not installed")
             return None
 
         video_dir = os.path.join(output_dir, f"vid_{scene_index:03d}")
@@ -56,90 +132,321 @@ class BrowserCapture:
                 )
                 page = await ctx.new_page()
 
-                # Navigate
+                # ── Navigate with SPA-friendly strategy ───────────────────
+                await self._navigate(page, url, scene_index)
+
+                # Inject cursor overlay
                 try:
-                    await page.goto(url, wait_until="networkidle", timeout=20000)
+                    await page.evaluate(_CURSOR_JS)
                 except Exception:
-                    try:
-                        await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-                    except Exception as e:
-                        logger.warning("Navigation failed for %s: %s", url, e)
+                    pass
+                await asyncio.sleep(0.3)
 
-                await asyncio.sleep(1.5)
+                # ── Perform action ────────────────────────────────────────
+                budget = max(duration - 1.8, 1.0)
+                await self._act(page, action, target, text, budget)
 
-                # Perform action(s) spread over the scene duration
-                action_budget = max(duration - 2.0, 1.0)
-
-                if action == "scroll" and not target:
-                    # Smooth scroll across the scene
-                    steps = max(int(action_budget / 0.8), 3)
-                    for _ in range(steps):
-                        await page.evaluate("window.scrollBy({top: 180, behavior: 'smooth'})")
-                        await asyncio.sleep(0.8)
-                elif action == "scroll" and target:
-                    try:
-                        await page.locator(target).scroll_into_view_if_needed(timeout=3000)
-                        await asyncio.sleep(1.0)
-                        await page.evaluate("window.scrollBy({top: 200, behavior: 'smooth'})")
-                        await asyncio.sleep(action_budget - 1.0)
-                    except Exception:
-                        await asyncio.sleep(action_budget)
-                elif action == "click" and target:
-                    try:
-                        await page.locator(target).first.click(timeout=3000)
-                        await asyncio.sleep(action_budget)
-                    except Exception:
-                        await asyncio.sleep(action_budget)
-                elif action == "type" and target:
-                    try:
-                        await page.locator(target).first.click(timeout=3000)
-                        await page.keyboard.type(
-                            scene_index and "Demo input text" or "Hello world",
-                            delay=80,
-                        )
-                        await asyncio.sleep(max(action_budget - 1.5, 0.5))
-                    except Exception:
-                        await asyncio.sleep(action_budget)
-                else:
-                    # "navigate" or "wait" – just let the page sit
-                    await asyncio.sleep(action_budget)
-
-                # Save video reference before closing — path only available after close
+                # Keep video reference before closing
                 video_obj = page.video
-
-                # Closing the context finalises and saves the recording
                 await ctx.close()
                 await browser.close()
 
-            # Get path from video object (reliable after context close)
+            # ── Retrieve recorded file ────────────────────────────────────
             src_path = None
             if video_obj:
                 try:
-                    src_path = video_obj.path()
+                    src_path = await video_obj.path()   # Playwright ≥1.50 async
+                except TypeError:
+                    try:
+                        src_path = video_obj.path()     # Older sync fallback
+                    except Exception:
+                        pass
                 except Exception as e:
-                    logger.warning("video.path() failed: %s", e)
+                    logger.warning("video.path() error: %s", e)
 
-            # Fallback: glob the directory
+            # Glob fallback
             if not src_path or not os.path.exists(src_path):
-                recorded = list(Path(video_dir).glob("*.webm"))
-                src_path = str(recorded[0]) if recorded else None
+                found = list(Path(video_dir).glob("*.webm"))
+                src_path = str(found[0]) if found else None
 
             if not src_path or not os.path.exists(src_path):
-                logger.error("No video recorded for scene %d", scene_index)
+                logger.error("Scene %d: no .webm file found", scene_index)
                 shutil.rmtree(video_dir, ignore_errors=True)
                 return None
-
-            file_size = os.path.getsize(src_path)
-            if file_size < 1024:
-                logger.warning("Scene %d webm is too small (%d bytes) – likely blank", scene_index, file_size)
 
             dest = os.path.join(output_dir, f"scene_{scene_index:03d}.webm")
             shutil.move(src_path, dest)
             shutil.rmtree(video_dir, ignore_errors=True)
-            logger.info("Scene %d recorded: %s (%.1fs, %d bytes)", scene_index, dest, duration, file_size)
+            logger.info("Scene %d recorded: %.1fs  %d bytes",
+                        scene_index, duration, os.path.getsize(dest))
             return dest
 
         except Exception as exc:
-            logger.exception("BrowserCapture failed scene %d: %s", scene_index, exc)
+            logger.exception("BrowserCapture scene %d failed: %s", scene_index, exc)
             shutil.rmtree(video_dir, ignore_errors=True)
             return None
+
+    # ── Navigation ────────────────────────────────────────────────────────────
+
+    async def _navigate(self, page, url: str, scene_index: int):
+        """
+        SPA-friendly navigation strategy:
+        1. Try networkidle (best quality, may timeout on SPAs with polling)
+        2. Fall back to load event
+        3. Fall back to domcontentloaded + fixed wait
+        Always scroll to top after navigation so recording starts from the top.
+        """
+        for wait_until, timeout in [
+            ("networkidle", 15000),
+            ("load",        12000),
+            ("domcontentloaded", 8000),
+        ]:
+            try:
+                await page.goto(url, wait_until=wait_until, timeout=timeout)
+                break
+            except Exception as e:
+                logger.debug("Scene %d navigation (%s) failed: %s",
+                             scene_index, wait_until, e)
+        else:
+            logger.warning("Scene %d: all navigation strategies failed for %s",
+                           scene_index, url)
+
+        # Give React/Vue/Angular time to fully render after route mount
+        await asyncio.sleep(2.0)
+
+        # Scroll to top so the scene always starts from the beginning of the page
+        try:
+            await page.evaluate("window.scrollTo({top: 0, behavior: 'instant'})")
+        except Exception:
+            pass
+        await asyncio.sleep(0.3)
+
+    # ── Action dispatcher ─────────────────────────────────────────────────────
+
+    async def _act(self, page, action: str, target: str, text: str, budget: float):
+        if action == "scroll":
+            await self._scroll(page, target, budget)
+        elif action == "click":
+            await self._click(page, target, budget)
+        elif action == "type":
+            await self._type(page, target, text, budget)
+        elif action == "hover":
+            await self._hover(page, target, budget)
+        else:
+            # navigate / wait – display cursor and let page sit
+            await self._idle(page, budget)
+
+    # ── Individual actions ────────────────────────────────────────────────────
+
+    async def _idle(self, page, budget: float):
+        """Show cursor in viewport centre and hold."""
+        cx, cy = self.width // 2, self.height // 3
+        try:
+            await page.evaluate(f"window.__dv_show && window.__dv_show({cx},{cy})")
+        except Exception:
+            pass
+        await asyncio.sleep(budget)
+
+    async def _scroll(self, page, target: str, budget: float):
+        """
+        Smooth scroll across the scene duration.
+        If target is given, scroll that element into view first.
+        Otherwise scroll down ~70 % of the page height over the budget.
+        """
+        cx, cy = self.width // 2, self.height // 2
+        try:
+            await page.evaluate(f"window.__dv_show && window.__dv_show({cx},{cy})")
+        except Exception:
+            pass
+        await asyncio.sleep(0.2)
+
+        if target:
+            try:
+                info = await page.evaluate(
+                    "(sel) => { const el = document.querySelector(sel);"
+                    " if(!el) return null;"
+                    " el.scrollIntoView({behavior:'smooth',block:'center'});"
+                    " const r=el.getBoundingClientRect();"
+                    " return {x:r.left+r.width/2, y:r.top+r.height/2}; }",
+                    target,
+                )
+                if info:
+                    await page.evaluate(
+                        f"window.__dv_show && window.__dv_show({info['x']},{info['y']})"
+                    )
+                # After scrolling to element, continue scrolling slowly to show context
+                remaining = budget - 1.5
+                if remaining > 0:
+                    await asyncio.sleep(1.5)
+                    await self._slow_scroll(page, cx, cy, remaining)
+                else:
+                    await asyncio.sleep(budget)
+                return
+            except Exception as e:
+                logger.debug("Scroll-to-target failed: %s", e)
+
+        # General scroll over the full budget
+        try:
+            metrics = await page.evaluate(
+                "() => ({sh: document.body.scrollHeight,"
+                " ih: window.innerHeight, sy: window.scrollY})"
+            )
+            max_scroll = max(metrics["sh"] - metrics["ih"], 0)
+        except Exception:
+            max_scroll = 800
+
+        if max_scroll < 50:
+            await asyncio.sleep(budget)
+            return
+
+        await self._slow_scroll(page, cx, cy, budget, distance=max_scroll * 0.75)
+
+    async def _slow_scroll(self, page, cx: float, cy: float,
+                           budget: float, distance: float = 0):
+        """Distribute scroll distance evenly over budget with cursor movement."""
+        if distance == 0:
+            try:
+                metrics = await page.evaluate(
+                    "() => ({sh: document.body.scrollHeight, ih: window.innerHeight})"
+                )
+                distance = max(metrics["sh"] - metrics["ih"], 400) * 0.75
+            except Exception:
+                distance = 600
+
+        steps = max(int(budget / 0.4), 6)
+        px_per_step = distance / steps
+        interval = budget / steps
+
+        for i in range(steps):
+            try:
+                await page.evaluate(
+                    f"window.scrollBy({{top:{px_per_step:.0f},behavior:'smooth'}})"
+                )
+                nx = cx + (i % 3 - 1) * 25
+                ny = cy - i * 4
+                await page.evaluate(f"window.__dv_move && window.__dv_move({nx},{ny})")
+            except Exception:
+                pass
+            await asyncio.sleep(interval)
+
+    async def _click(self, page, target: str, budget: float):
+        """
+        Move cursor to element → ripple → click → wait for result.
+        After the click, scroll slowly to reveal whatever was loaded/changed.
+        Falls back to idle + scroll if target is missing or not found.
+        """
+        if not target:
+            await self._idle_then_scroll(page, budget)
+            return
+
+        clicked = False
+        try:
+            # Wait for element to appear on page (SPA nav items may load async)
+            await page.locator(target).first.wait_for(state="visible", timeout=8000)
+            await asyncio.sleep(0.3)
+
+            await page.locator(target).first.scroll_into_view_if_needed(timeout=4000)
+            await asyncio.sleep(0.4)
+
+            bbox = await page.locator(target).first.bounding_box()
+            if bbox:
+                cx = bbox["x"] + bbox["width"]  / 2
+                cy = bbox["y"] + bbox["height"] / 2
+
+                # Show cursor approaching the button
+                await page.evaluate(f"window.__dv_show && window.__dv_show({cx},{cy})")
+                await asyncio.sleep(0.5)
+
+                # Ripple → click
+                await page.evaluate(f"window.__dv_ripple && window.__dv_ripple({cx},{cy})")
+                await asyncio.sleep(0.15)
+                await page.locator(target).first.click(timeout=5000)
+                clicked = True
+
+                # Wait for navigation or async results (AI agents, API calls, etc.)
+                # Allow up to 10 seconds for the page to settle after click
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    try:
+                        await page.wait_for_load_state("load", timeout=5000)
+                    except Exception:
+                        pass
+
+                # Give JS/animations time to render results on screen
+                await asyncio.sleep(2.0)
+
+                # Re-inject cursor (SPA re-renders may destroy it)
+                try:
+                    await page.evaluate(_CURSOR_JS)
+                except Exception:
+                    pass
+
+                # Scroll slowly through the results for the remainder of the budget
+                used = 1.0 + 0.5 + 0.15 + 2.0   # rough time already spent
+                remaining = max(budget - used, 1.0)
+                await self._slow_scroll(page, self.width // 2, self.height // 2,
+                                        remaining)
+        except Exception as e:
+            logger.warning("Click action failed '%s': %s", target, e)
+
+        if not clicked:
+            await self._idle_then_scroll(page, budget)
+
+    async def _idle_then_scroll(self, page, budget: float):
+        """Hold at top for 30% of budget, then scroll through the page."""
+        hold = budget * 0.30
+        scroll_time = budget - hold
+        cx, cy = self.width // 2, self.height // 3
+        try:
+            await page.evaluate(f"window.__dv_show && window.__dv_show({cx},{cy})")
+        except Exception:
+            pass
+        await asyncio.sleep(hold)
+        await self._slow_scroll(page, cx, cy, scroll_time)
+
+    async def _type(self, page, target: str, text: str, budget: float):
+        """Click input, type text character-by-character at natural speed."""
+        type_text = text.strip() if text.strip() else "Demo text"
+        try:
+            if target:
+                await page.locator(target).first.scroll_into_view_if_needed(timeout=4000)
+                bbox = await page.locator(target).first.bounding_box()
+                if bbox:
+                    cx = bbox["x"] + bbox["width"]  / 2
+                    cy = bbox["y"] + bbox["height"] / 2
+                    await page.evaluate(f"window.__dv_show && window.__dv_show({cx},{cy})")
+                    await asyncio.sleep(0.35)
+                    await page.evaluate(f"window.__dv_ripple && window.__dv_ripple({cx},{cy})")
+                    await asyncio.sleep(0.1)
+                await page.locator(target).first.click(timeout=5000)
+                await asyncio.sleep(0.25)
+
+            # Natural typing: use 60% of budget for key presses
+            type_budget = budget * 0.60
+            delay_ms = max(int(type_budget * 1000 / max(len(type_text), 1)), 50)
+            delay_ms = min(delay_ms, 160)
+            await page.keyboard.type(type_text, delay=delay_ms)
+            await asyncio.sleep(max(budget - len(type_text) * delay_ms / 1000, 0.4))
+        except Exception as e:
+            logger.warning("Type action failed '%s': %s", target, e)
+            await asyncio.sleep(budget)
+
+    async def _hover(self, page, target: str, budget: float):
+        """Move cursor to element and hover (reveals tooltips, dropdowns)."""
+        if not target:
+            await self._idle(page, budget)
+            return
+        try:
+            await page.locator(target).first.scroll_into_view_if_needed(timeout=4000)
+            bbox = await page.locator(target).first.bounding_box()
+            if bbox:
+                cx = bbox["x"] + bbox["width"]  / 2
+                cy = bbox["y"] + bbox["height"] / 2
+                await page.evaluate(f"window.__dv_show && window.__dv_show({cx},{cy})")
+                await asyncio.sleep(0.4)
+                await page.locator(target).first.hover(timeout=5000)
+            await asyncio.sleep(budget)
+        except Exception as e:
+            logger.warning("Hover action failed '%s': %s", target, e)
+            await asyncio.sleep(budget)
