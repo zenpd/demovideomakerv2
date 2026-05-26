@@ -182,6 +182,7 @@ async def _run_job(job_id, script, app_url, voice, max_duration, resolution, add
                 target=scene.get("target", ""),
                 text=scene.get("text", ""),
                 wait_for=scene.get("wait_for", ""),
+                narration=scene.get("narration", ""),
                 duration=scene["duration"],
                 output_dir=str(job_dir),
                 scene_index=i,

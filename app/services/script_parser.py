@@ -9,7 +9,9 @@ Scene dict:
     "narration": str,
     "url": str | None,     # override app_url for this scene
     "action": str,         # "navigate" | "scroll" | "click" | "wait"
-    "target": str,         # CSS selector or empty    "wait_for": str,       # CSS selector to wait for before starting action  }
+    "target": str,         # CSS selector or empty
+    "wait_for": str,       # CSS selector to wait for before starting action
+  }
 
 Script format (simplest):
   ## Scene Title
@@ -18,14 +20,32 @@ Script format (simplest):
 
 Or plain paragraphs – each paragraph becomes a scene.
 """
+import logging
 import re
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 try:
     import yaml
     _HAS_YAML = True
 except ImportError:
     _HAS_YAML = False
+
+# ── Narration-to-action inference ────────────────────────────────────────────
+# Patterns that detect navigation intent in narration text.
+# Each pattern captures the destination label in group 1.
+_NAV_PATTERNS = [
+    # "let's open Analytics", "let's go to Agent Status"
+    r"let['’]?s\s+(?:open|go\s+to|navigate\s+to|click\s+on|visit|view|switch\s+to)\s+(?:the\s+)?([A-Z][A-Za-z\s]{2,40}?)(?:\.|,|$|\s+(?:tab|page|section|module|dashboard|panel|view))",
+    # "navigate to the Analytics Dashboard"
+    r"(?:navigate|go)\s+to\s+(?:the\s+)?([A-Z][A-Za-z\s]{2,40}?)(?:\.|,|$|\s+(?:tab|page|section|module|dashboard|panel|view))",
+    # "open the Agent Status module" / "click the Analytics tab"
+    r"(?:open|click|select|access)\s+(?:the\s+)?([A-Z][A-Za-z\s]{2,40}?)(?:\s+(?:tab|page|section|module|dashboard|panel|view)|\.|,|$)",
+    # "now we'll look at Analytics"
+    r"now\s+(?:we['’]?ll|let['’]?s|we\s+can)\s+(?:look\s+at|explore|examine|review|see)\s+(?:the\s+)?([A-Z][A-Za-z\s]{2,40}?)(?:\.|,|$)",
+]
+_NAV_RE = [re.compile(p, re.IGNORECASE) for p in _NAV_PATTERNS]
 
 
 class ScriptParser:
@@ -56,7 +76,43 @@ class ScriptParser:
         if scenes and demo_title:
             scenes[0]["demo_title"] = demo_title
 
+        # ── Auto-upgrade navigate → click when narration implies navigation ──
+        # Only applies when no explicit [action:] directive was set (action=navigate)
+        # and no [target:] was given, so we never override what the user wrote.
+        for scene in scenes:
+            if scene.get("action") == "navigate" and not scene.get("target"):
+                inferred = self._infer_nav_action(scene["narration"])
+                if inferred:
+                    scene["action"] = "click"
+                    scene["target"] = f"text={inferred}"
+                    logger.info(
+                        "Scene %d '%s': auto-inferred click target '%s' from narration",
+                        scene["index"], scene["title"], inferred,
+                    )
+
         return scenes
+
+    # ── Narration inference ──────────────────────────────────────────
+
+    def _infer_nav_action(self, narration: str) -> str:
+        """
+        Scan the narration for navigation intent phrases and return the
+        destination label to click, or empty string if none found.
+
+        Examples that trigger inference:
+          "Let's open Analytics"           → "Analytics"
+          "Navigate to the Agent Status"   → "Agent Status"
+          "Now let's go to the Dashboard"  → "Dashboard"
+          "Click the Payment Routing tab"  → "Payment Routing"
+        """
+        for pattern in _NAV_RE:
+            m = pattern.search(narration)
+            if m:
+                label = m.group(1).strip().rstrip(".,;:")
+                # Reject overly long matches or ones without a capital letter
+                if 2 <= len(label) <= 50 and re.search(r'[A-Z]', label):
+                    return label
+        return ""
 
     # ── Markdown parser ──────────────────────────────────────────────
 

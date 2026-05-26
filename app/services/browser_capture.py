@@ -11,9 +11,14 @@ For each scene:
 import asyncio
 import logging
 import os
+import random
+import re
 import shutil
 from pathlib import Path
 from typing import Optional
+
+# Max times _click will retry after an element-detach or stale-element error
+_MAX_CLICK_RETRIES = 3
 
 logger = logging.getLogger(__name__)
 
@@ -99,10 +104,13 @@ class BrowserCapture:
         scene_index: int,
         text: str = "",
         wait_for: str = "",
+        narration: str = "",   # used for context-aware scroll/nav fallback
     ) -> Optional[str]:
         """
         Record the browser performing the specified action.
         Returns path to the .webm file, or None on failure.
+        narration is forwarded to actions so they can infer scroll targets
+        and fallback navigation from the spoken text.
         """
         try:
             from playwright.async_api import async_playwright
@@ -145,7 +153,18 @@ class BrowserCapture:
 
                 # ── Perform action ────────────────────────────────────────
                 budget = max(duration - 1.8, 1.0)
-                await self._act(page, action, target, text, budget, wait_for)
+                action_ok = await self._act(
+                    page, action, target, text, budget, wait_for, narration
+                )
+
+                # Screenshot on click failure for debugging
+                if not action_ok and action == "click":
+                    try:
+                        ss = os.path.join(output_dir, f"scene_{scene_index:03d}_fail.png")
+                        await page.screenshot(path=ss, full_page=False)
+                        logger.warning("Scene %d click failed – screenshot: %s", scene_index, ss)
+                    except Exception:
+                        pass
 
                 # Keep video reference before closing
                 video_obj = page.video
@@ -191,16 +210,29 @@ class BrowserCapture:
 
     async def _navigate(self, page, url: str, scene_index: int, action: str = "navigate"):
         """
-        SPA-friendly navigation strategy:
-        1. Try networkidle (best quality, may timeout on SPAs with polling)
-        2. Fall back to load event
-        3. Fall back to domcontentloaded + fixed wait
-        Always scroll to top after navigation so recording starts from the top.
+        SPA-friendly navigation strategy.
 
-        For 'click' action scenes, uses a short render wait (1.0s) so the
-        nav click happens immediately at scene start — no visible homepage flash.
-        For all other scenes, waits 3.5s for full SPA render.
+        Click scenes: use ONLY domcontentloaded (fires as soon as the HTML DOM is
+        parsed, typically <1s). No fallback retries, no render wait.
+        _resolve_locator handles waiting for the nav element to become visible.
+        This prevents the 15s networkidle timeout from showing the homepage for
+        20+ seconds before the click, which desynchronises audio and video.
+
+        Non-click scenes: try networkidle first for best quality, fall back to
+        load then domcontentloaded, then wait 3.5s for the SPA to fully render.
         """
+        if action == "click":
+            # Fast path: only wait for DOM to exist, nothing more.
+            # _click → _resolve_locator will wait up to 15s for the nav item.
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=8000)
+            except Exception as e:
+                logger.debug("Scene %d click-navigate domcontentloaded failed: %s",
+                             scene_index, e)
+            # No render_wait — the less homepage we show, the better.
+            return
+
+        # Non-click path: quality-first with fallbacks
         for wait_until, timeout in [
             ("networkidle", 15000),
             ("load",        12000),
@@ -216,10 +248,8 @@ class BrowserCapture:
             logger.warning("Scene %d: all navigation strategies failed for %s",
                            scene_index, url)
 
-        # For click scenes: short wait so we jump straight to the nav click.
-        # For navigate/scroll/wait scenes: full 3.5s to let SPA fully render.
-        render_wait = 2.5 if action == "click" else 3.5
-        await asyncio.sleep(render_wait)
+        # Give React/Vue/Angular time to fully render after route mount
+        await asyncio.sleep(3.5)
 
         # Scroll to top so the scene always starts from the beginning of the page
         try:
@@ -230,18 +260,31 @@ class BrowserCapture:
 
     # ── Action dispatcher ─────────────────────────────────────────────────────
 
-    async def _act(self, page, action: str, target: str, text: str, budget: float, wait_for: str = ""):
+    async def _act(
+        self, page, action: str, target: str, text: str,
+        budget: float, wait_for: str = "", narration: str = ""
+    ) -> bool:
+        """Dispatch to the correct action handler. Returns True on success."""
         if action == "scroll":
-            await self._scroll(page, target, budget)
+            await self._scroll(page, target, budget, narration=narration)
+            return True
         elif action == "click":
-            await self._click(page, target, budget, wait_for)
+            return await self._click(page, target, budget, wait_for, narration=narration)
         elif action == "type":
             await self._type(page, target, text, budget)
+            return True
         elif action == "hover":
             await self._hover(page, target, budget)
+            return True
         else:
-            # navigate / wait – display cursor and let page sit
+            # navigate / wait – use narration to scroll to relevant keyword
+            if narration:
+                keyword = self._extract_keyword(narration)
+                if keyword:
+                    await self.smart_scroll_to_keyword(page, keyword, budget)
+                    return True
             await self._idle(page, budget)
+            return True
 
     # ── Resilient locator resolver ────────────────────────────────────────────
 
@@ -260,16 +303,30 @@ class BrowserCapture:
         # Strip surrounding quotes if the caller passed e.g. "Analytics"
         bare = target.strip('"\'')
 
-        # Also strip a leading "text=" prefix so we can build variants from the label
+        # Strip a leading "text=" prefix so we can build variants from the label
         if bare.lower().startswith("text="):
             bare = bare[5:].strip()
 
-        # Build the candidate list, always including the original plus all variants
+        # Build candidates: original first, then progressively broader strategies.
+        # Navigation-specific selectors (nav/sidebar/menu) are tried before generic ones
+        # because they are far less likely to match decorative text on the page.
         candidates = [target]
-        # Add fallback variants regardless of what prefix the original had
         variants = [
+            # Exact Playwright text selector
             f"text={bare}",
+            # Case-insensitive regex text
             f"text=/{bare}/i",
+            # Nav/sidebar containers first – most precise for menu items
+            f"nav :has-text(\"{bare}\")",
+            f"[role=navigation] :has-text(\"{bare}\")",
+            f"aside :has-text(\"{bare}\")",
+            f"[class*=sidebar] :has-text(\"{bare}\")",
+            f"[class*=menu] :has-text(\"{bare}\")",
+            f"[class*=nav] :has-text(\"{bare}\")",
+            # Interactive element types
+            f"a:has-text(\"{bare}\")",
+            f"button:has-text(\"{bare}\")",
+            # Generic partial match – last resort
             f":has-text(\"{bare}\")",
             f"[aria-label*=\"{bare}\" i]",
         ]
@@ -281,7 +338,7 @@ class BrowserCapture:
             try:
                 loc = page.locator(sel).first
                 await loc.wait_for(state="visible", timeout=timeout)
-                logger.debug("Resolved selector '%s' → '%s'", target, sel)
+                logger.info("Resolved selector '%s' → '%s'", target, sel)
                 return loc
             except Exception:
                 continue
@@ -300,11 +357,140 @@ class BrowserCapture:
             pass
         await asyncio.sleep(budget)
 
-    async def _scroll(self, page, target: str, budget: float):
+    async def smart_scroll_to_keyword(self, page, keyword: str, budget: float):
+        """
+        DOM text search: find the element containing keyword and scroll to it,
+        then continue scrolling slowly for the remainder of the budget.
+        Falls back to full-page scroll if keyword not found.
+        """
+        cx, cy = self.width // 2, self.height // 2
+        try:
+            await page.evaluate(f"window.__dv_show && window.__dv_show({cx},{cy})")
+        except Exception:
+            pass
+
+        found = False
+        try:
+            info = await page.evaluate(
+                """
+                (kw) => {
+                    const walker = document.createTreeWalker(
+                        document.body, NodeFilter.SHOW_TEXT, null
+                    );
+                    let node;
+                    while ((node = walker.nextNode())) {
+                        if (node.textContent.toLowerCase().includes(kw.toLowerCase())) {
+                            const el = node.parentElement;
+                            if (!el) continue;
+                            el.scrollIntoView({behavior: 'smooth', block: 'center'});
+                            const r = el.getBoundingClientRect();
+                            return {x: r.left + r.width/2, y: r.top + r.height/2};
+                        }
+                    }
+                    return null;
+                }
+                """,
+                keyword,
+            )
+            if info:
+                await page.evaluate(
+                    f"window.__dv_show && window.__dv_show({info['x']},{info['y']})"
+                )
+                await asyncio.sleep(1.2)
+                remaining = max(budget - 1.5, 1.0)
+                await self._slow_scroll(page, cx, cy, remaining)
+                found = True
+        except Exception as e:
+            logger.debug("smart_scroll_to_keyword '%s' failed: %s", keyword, e)
+
+        if not found:
+            await self._slow_scroll(page, cx, cy, budget)
+
+    def _extract_keyword(self, narration: str) -> str:
+        """
+        Extract the most likely scroll-target keyword from narration.
+        Looks for Title Case phrases (proper nouns / section headings).
+        """
+        # Title-case multi-word phrases first (e.g. "Analytics Dashboard")
+        phrases = re.findall(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b', narration)
+        if phrases:
+            return phrases[0]
+        # Single capitalized words (e.g. "Dashboard", "Analytics")
+        words = re.findall(r'\b([A-Z][a-z]{4,})\b', narration)
+        if words:
+            return words[0]
+        return ""
+
+    async def _smart_nav_from_narration(self, page, narration: str) -> Optional[str]:
+        """
+        Lightweight semantic matching: collect visible nav/sidebar item labels from
+        the page, then use rapidfuzz (or simple contains) to find the best match
+        for the narration's implied navigation target.
+        Returns the matched label string or None.
+        """
+        try:
+            nav_texts: list = await page.evaluate(
+                """
+                () => {
+                    const seen = new Set();
+                    const result = [];
+                    const sels = [
+                        'nav a', 'nav button', '[role=navigation] a',
+                        '[role=navigation] button', 'aside a', 'aside button',
+                        '[class*="sidebar"] a', '[class*="sidebar"] button',
+                        '[class*="menu"] a',   '[class*="menu"] button',
+                        '[class*="nav"] a',    '[class*="nav"] button',
+                    ];
+                    for (const sel of sels) {
+                        for (const el of document.querySelectorAll(sel)) {
+                            const t = el.textContent.trim();
+                            if (t && t.length < 60 && !seen.has(t)) {
+                                seen.add(t);
+                                result.push(t);
+                            }
+                        }
+                    }
+                    return result;
+                }
+                """
+            )
+        except Exception:
+            return None
+
+        if not nav_texts:
+            return None
+
+        # Extract candidate keywords from narration (Title Case phrases)
+        phrases = re.findall(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b', narration)
+        if not phrases:
+            return None
+        query = ' '.join(phrases[:6])
+
+        # Try rapidfuzz first; fall back to simple substring matching
+        try:
+            from rapidfuzz import process, fuzz
+            result = process.extractOne(
+                query, nav_texts, scorer=fuzz.partial_ratio, score_cutoff=55
+            )
+            if result:
+                logger.info("Narration-inferred nav target: '%s' (score=%d)", result[0], result[1])
+                return result[0]
+        except ImportError:
+            # rapidfuzz not installed – simple contains fallback
+            for phrase in phrases:
+                for nav_text in nav_texts:
+                    if phrase.lower() in nav_text.lower():
+                        logger.info("Narration-inferred nav target (contains): '%s'", nav_text)
+                        return nav_text
+
+        return None
+
+    async def _scroll(self, page, target: str, budget: float, narration: str = ""):
         """
         Smooth scroll across the scene duration.
         If target is given, scroll that element into view first.
-        Otherwise scroll down ~70 % of the page height over the budget.
+        If narration is given and no target, use keyword-aware scrolling.
+        Otherwise scroll down the full page height over the budget.
         """
         cx, cy = self.width // 2, self.height // 2
         try:
@@ -337,6 +523,14 @@ class BrowserCapture:
                 return
             except Exception as e:
                 logger.debug("Scroll-to-target failed: %s", e)
+
+        # Narration-aware keyword scroll: find and scroll to the relevant section
+        if narration:
+            keyword = self._extract_keyword(narration)
+            if keyword:
+                logger.debug("Scroll using narration keyword: '%s'", keyword)
+                await self.smart_scroll_to_keyword(page, keyword, budget)
+                return
 
         # General scroll over the full budget
         try:
@@ -397,90 +591,132 @@ class BrowserCapture:
                     await page.evaluate(
                         f"window.scrollBy({{top:{px_per_step:.0f},behavior:'smooth'}})"
                     )
-                    nx = cx + (i % 3 - 1) * 20
-                    ny = cy
-                    await page.evaluate(f"window.__dv_move && window.__dv_move({nx},{ny})")
+                    # Human-like cursor drift: random small offset each step
+                    nx = cx + random.uniform(-18, 18)
+                    ny = cy + random.uniform(-8, 8)
+                    await page.evaluate(f"window.__dv_move && window.__dv_move({nx:.1f},{ny:.1f})")
                 except Exception:
                     pass
-                await asyncio.sleep(interval)
+                # Human-like timing: add small random jitter to each scroll interval
+                jitter = random.uniform(-0.05, 0.08)
+                await asyncio.sleep(max(interval + jitter, 0.05))
 
             # Pause at this section so audience reads/hears the content
             # (skip final pause to not over-extend last section)
             if section < sections - 1:
-                await asyncio.sleep(pause_time_per_section)
+                # Add slight random variation to pause duration
+                await asyncio.sleep(pause_time_per_section * random.uniform(0.85, 1.10))
 
-    async def _click(self, page, target: str, budget: float, wait_for: str = ""):
+    async def _click(
+        self, page, target: str, budget: float,
+        wait_for: str = "", narration: str = ""
+    ) -> bool:
         """
         Move cursor to element → ripple → click → wait for result.
-        After the click, scroll slowly to reveal whatever was loaded/changed.
-        Falls back to idle + scroll if target is missing or not found.
-        If wait_for is provided, waits for that selector before starting scroll.
+        Retries up to _MAX_CLICK_RETRIES times on stale/detached element errors.
+        If explicit target fails entirely, attempts narration-based nav inference.
+        Returns True if click succeeded.
         """
-        if not target:
+        if not target and not narration:
             await self._idle_then_scroll(page, budget)
-            return
+            return False
+
+        # If no explicit target but narration provided, infer from page nav items
+        effective_target = target
+        if not effective_target and narration:
+            inferred = await self._smart_nav_from_narration(page, narration)
+            if inferred:
+                logger.info("Using narration-inferred target: '%s'", inferred)
+                effective_target = inferred
+
+        if not effective_target:
+            await self._idle_then_scroll(page, budget)
+            return False
 
         clicked = False
-        try:
-            loc = await self._resolve_locator(page, target, timeout=10000)
-            if loc is None:
-                logger.warning("Click: no element matched '%s', falling back", target)
-            else:
+        for attempt in range(1, _MAX_CLICK_RETRIES + 1):
+            try:
+                loc = await self._resolve_locator(page, effective_target, timeout=15000)
+                if loc is None:
+                    logger.warning("Click attempt %d: no element for '%s'", attempt, effective_target)
+                    # On last attempt: try narration-inferred target as fallback
+                    if attempt == _MAX_CLICK_RETRIES and narration and effective_target == target:
+                        inferred = await self._smart_nav_from_narration(page, narration)
+                        if inferred and inferred != effective_target:
+                            logger.info("Retrying with narration-inferred target: '%s'", inferred)
+                            effective_target = inferred
+                            continue
+                    break
+
                 await loc.scroll_into_view_if_needed(timeout=4000)
-                await asyncio.sleep(0.4)
+                await asyncio.sleep(random.uniform(0.3, 0.5))  # human-like pre-click pause
 
                 bbox = await loc.bounding_box()
-                if bbox:
-                    cx = bbox["x"] + bbox["width"]  / 2
-                    cy = bbox["y"] + bbox["height"] / 2
-
-                    # Show cursor approaching the button
-                    await page.evaluate(f"window.__dv_show && window.__dv_show({cx},{cy})")
+                if not bbox:
+                    logger.warning("Click attempt %d: no bounding box for '%s'", attempt, effective_target)
                     await asyncio.sleep(0.5)
+                    continue
 
-                    # Ripple → click
-                    await page.evaluate(f"window.__dv_ripple && window.__dv_ripple({cx},{cy})")
-                    await asyncio.sleep(0.15)
-                    await loc.click(timeout=5000)
-                    clicked = True
+                cx = bbox["x"] + bbox["width"]  / 2
+                cy = bbox["y"] + bbox["height"] / 2
 
-                    # Wait for navigation or async results (AI agents, API calls, etc.)
-                    # Allow up to 10 seconds for the page to settle after click
-                    try:
-                        await page.wait_for_load_state("networkidle", timeout=10000)
-                    except Exception:
-                        try:
-                            await page.wait_for_load_state("load", timeout=5000)
-                        except Exception:
-                            pass
+                # Animate cursor approaching from slightly off-position (human-like)
+                start_x = cx + random.uniform(-40, 40)
+                start_y = cy + random.uniform(-20, 20)
+                await page.evaluate(f"window.__dv_show && window.__dv_show({start_x:.1f},{start_y:.1f})")
+                await asyncio.sleep(random.uniform(0.2, 0.35))
+                await page.evaluate(f"window.__dv_move && window.__dv_move({cx:.1f},{cy:.1f})")
+                await asyncio.sleep(random.uniform(0.15, 0.25))
 
-                    # If wait_for selector provided, wait for it to appear (pauses timeline)
-                    if wait_for:
-                        try:
-                            await page.locator(wait_for).first.wait_for(state="visible", timeout=8000)
-                            logger.debug("wait_for selector visible: %s", wait_for)
-                        except Exception as e:
-                            logger.warning("wait_for failed '%s': %s", wait_for, e)
+                # Ripple → click
+                await page.evaluate(f"window.__dv_ripple && window.__dv_ripple({cx:.1f},{cy:.1f})")
+                await asyncio.sleep(random.uniform(0.10, 0.18))
+                await loc.click(timeout=5000)
+                clicked = True
+                logger.info("Clicked '%s' on attempt %d", effective_target, attempt)
+                break
 
-                    # Give JS/animations time to render results on screen (extended to 4s)
-                    await asyncio.sleep(4.0)
-
-                    # Re-inject cursor (SPA re-renders may destroy it)
-                    try:
-                        await page.evaluate(_CURSOR_JS)
-                    except Exception:
-                        pass
-
-                    # Scroll slowly through the results for the remainder of the budget
-                    used = 1.0 + 0.5 + 0.15 + 4.0   # rough time already spent
-                    remaining = max(budget - used, 1.0)
-                    await self._slow_scroll(page, self.width // 2, self.height // 2,
-                                            remaining)
-        except Exception as e:
-            logger.warning("Click action failed '%s': %s", target, e)
+            except Exception as e:
+                logger.warning("Click attempt %d failed for '%s': %s", attempt, effective_target, e)
+                if attempt < _MAX_CLICK_RETRIES:
+                    await asyncio.sleep(0.8 * attempt)  # backoff before retry
 
         if not clicked:
+            logger.warning("All click attempts failed for '%s', falling back", effective_target)
             await self._idle_then_scroll(page, budget)
+            return False
+
+        # Post-click: wait for page to settle
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            try:
+                await page.wait_for_load_state("load", timeout=5000)
+            except Exception:
+                pass
+
+        # If wait_for selector provided, pause until target content is visible
+        if wait_for:
+            try:
+                await page.locator(wait_for).first.wait_for(state="visible", timeout=8000)
+                logger.debug("wait_for visible: %s", wait_for)
+            except Exception as e:
+                logger.warning("wait_for failed '%s': %s", wait_for, e)
+
+        # Allow JS/animations to finish rendering (human-like settle pause)
+        await asyncio.sleep(random.uniform(3.5, 4.5))
+
+        # Re-inject cursor (SPA re-renders can destroy the overlay)
+        try:
+            await page.evaluate(_CURSOR_JS)
+        except Exception:
+            pass
+
+        # Scroll through the loaded content for the remainder of the budget
+        used = 0.5 + 0.35 + 0.18 + 4.0  # approximate time spent above
+        remaining = max(budget - used, 1.0)
+        await self._slow_scroll(page, self.width // 2, self.height // 2, remaining)
+        return True
 
     async def _idle_then_scroll(self, page, budget: float):
         """Hold at top for 30% of budget, then scroll through the page."""

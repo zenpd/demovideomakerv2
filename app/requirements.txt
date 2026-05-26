@@ -6,3 +6,4 @@ pydantic
 pyyaml
 edge-tts
 playwright
+rapidfuzz
