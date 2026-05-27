@@ -334,10 +334,14 @@ class BrowserCapture:
             if v != target:
                 candidates.append(v)
 
-        for sel in candidates:
+        # Use a short per-candidate timeout so we don't stall 12× on failures.
+        # The caller's `timeout` is respected only for the first/most likely candidate.
+        per_candidate = min(timeout, 1200)
+        for i, sel in enumerate(candidates):
             try:
                 loc = page.locator(sel).first
-                await loc.wait_for(state="visible", timeout=timeout)
+                t = timeout if i == 0 else per_candidate
+                await loc.wait_for(state="visible", timeout=t)
                 logger.info("Resolved selector '%s' → '%s'", target, sel)
                 return loc
             except Exception:

@@ -1,19 +1,13 @@
 """
 Video Assembler – live browser recordings + TTS audio → polished MP4 via FFmpeg.
 
-Pass 1 : scale browser .webm + replace audio  → intermediate MP4
-Pass 2 : burn lower-third overlay via FFmpeg drawtext (textfile= avoids escaping issues)
-Final  : concat all clips → output MP4
-
-No PIL dependency.  All rendering is done in FFmpeg.
+Per scene : scale browser .webm + replace audio → MP4 clip (pure video, no overlay)
+Final     : concat all clips → output MP4
 """
 import asyncio
 import logging
 import os
-import re
-import shutil
 import subprocess
-import textwrap
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -109,8 +103,7 @@ def _scene_clip(
         logger.error("Scene %d: missing audio: %s", idx, audio)
         return False
 
-    # ── Pass 1: video + audio → intermediate (no overlay) ────────────────────
-    pass1 = output + ".p1.mp4"
+    # ── Encode: video + audio → output (no overlay) ────────────────────
     scale_vf = (
         f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
         f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,"
@@ -118,7 +111,7 @@ def _scene_clip(
     )
 
     if video and os.path.exists(video):
-        cmd1 = [
+        cmd = [
             _FFMPEG, "-y",
             "-i", video, "-i", audio,
             "-vf", scale_vf,
@@ -127,11 +120,11 @@ def _scene_clip(
             "-c:a", "aac", "-b:a", "192k", "-ar", "44100",
             "-pix_fmt", "yuv420p",
             "-t", str(dur + 0.15), "-shortest",
-            pass1,
+            output,
         ]
     else:
         logger.warning("Scene %d: no browser recording – colour card fallback", idx)
-        cmd1 = [
+        cmd = [
             _FFMPEG, "-y",
             "-f", "lavfi", "-i", f"color=c=0x0a0f2a:s={w}x{h}:r={fps}",
             "-i", audio,
@@ -140,86 +133,12 @@ def _scene_clip(
             "-c:a", "aac", "-b:a", "192k", "-ar", "44100",
             "-pix_fmt", "yuv420p",
             "-t", str(dur + 0.15), "-shortest",
-            pass1,
+            output,
         ]
 
-    if not _run(cmd1, timeout=300):
-        logger.error("Scene %d pass-1 failed", idx)
+    if not _run(cmd, timeout=300):
+        logger.error("Scene %d encoding failed", idx)
         return False
-
-    # ── Pass 2: burn overlay using textfile= (no FFmpeg escaping issues) ─────
-    caption_lines = _wrap_caption(narration, 80)
-    cap_fs   = max(13, h // 52)
-    title_fs = max(18, h // 34)
-    band_h   = title_fs + (cap_fs + 4) * max(len(caption_lines), 1) + 28
-    bar_y    = h - band_h - 6
-    text_y   = h - band_h + 10
-    cap_y    = h - band_h + 12 + title_fs
-    pb_w     = max(1, int(w * (idx + 1) / total))
-    badge    = f"{idx + 1}/{total}"
-
-    font      = _find_font(bold=False)
-    font_bold = _find_font(bold=True)
-    fa  = f":fontfile={font}"      if font      else ""
-    fab = f":fontfile={font_bold}" if font_bold else ""
-
-    title_f = output + ".t.txt"
-    cap_f   = output + ".c.txt"
-    try:
-        with open(title_f, "w", encoding="utf-8") as f:
-            f.write(title)
-        with open(cap_f, "w", encoding="utf-8") as f:
-            f.write("  ".join(caption_lines))
-    except Exception as e:
-        logger.warning("Scene %d: text file write failed (%s) – skipping overlay", idx, e)
-        shutil.move(pass1, output)
-        return True
-
-    vf_parts = [
-        f"drawbox=x=0:y={h - band_h}:w={w}:h={band_h}:color=0x080c26@0.88:t=fill",
-        f"drawbox=x=0:y={h - band_h}:w={w // 2}:h=4:color=0x3882f6:t=fill",
-        f"drawbox=x={w // 2}:y={h - band_h}:w={w // 2}:h=4:color=0x8b5cf6:t=fill",
-        f"drawbox=x=0:y={bar_y}:w={w}:h=5:color=0x141430@0.85:t=fill",
-        f"drawbox=x=0:y={bar_y}:w={pb_w}:h=5:color=0x3882f6:t=fill",
-        (f"drawtext=textfile={title_f}:x=18:y={text_y}"
-         f":fontsize={title_fs}:fontcolor=0xf0f5ff{fab}"
-         f":shadowx=2:shadowy=2:shadowcolor=0x000000@0.6"),
-        (f"drawtext=textfile={cap_f}:x=18:y={cap_y}"
-         f":fontsize={cap_fs}:fontcolor=0xa0b4dc{fa}"),
-        f"drawbox=x={w - 120}:y=10:w=110:h=30:color=0x080e28@0.80:t=fill",
-        (f"drawtext=text={badge}:x={w - 110}:y=18"
-         f":fontsize={max(13, h // 50)}:fontcolor=0xf0f5ff{fa}"),
-    ]
-
-    cmd2 = [
-        _FFMPEG, "-y",
-        "-i", pass1,
-        "-vf", ",".join(vf_parts),
-        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
-        "-c:a", "copy", "-pix_fmt", "yuv420p",
-        output,
-    ]
-    ok = _run(cmd2, timeout=300)
-
-    for f in [pass1, title_f, cap_f]:
-        try:
-            os.unlink(f)
-        except Exception:
-            pass
-
-    if not ok:
-        logger.warning("Scene %d: overlay failed – re-encoding without overlay", idx)
-        return _run([
-            _FFMPEG, "-y",
-            *([ "-i", video, "-i", audio, "-vf", scale_vf,
-                "-map", "0:v:0", "-map", "1:a:0"] if video and os.path.exists(video) else
-              [ "-f", "lavfi", "-i", f"color=c=0x0a0f2a:s={w}x{h}:r={fps}",
-                "-i", audio, "-map", "0:v:0", "-map", "1:a:0"]),
-            "-c:v", "libx264", "-preset", "fast", "-crf", "22",
-            "-c:a", "aac", "-b:a", "192k", "-ar", "44100",
-            "-pix_fmt", "yuv420p",
-            "-t", str(dur + 0.15), "-shortest", output,
-        ], timeout=300)
 
     return True
 
@@ -321,11 +240,6 @@ def _concat_clips(clips: List[str], output: str, work_dir: str) -> bool:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _wrap_caption(text: str, max_chars: int = 80) -> List[str]:
-    text = re.sub(r"\s+", " ", text).strip()
-    return textwrap.wrap(text, width=max_chars)[:2] if text else []
-
 
 def _run(cmd: List[str], timeout: int = 120) -> bool:
     logger.debug("FFmpeg: %s", " ".join(cmd))

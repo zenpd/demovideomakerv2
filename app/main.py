@@ -146,18 +146,20 @@ async def _run_job(job_id, script, app_url, voice, max_duration, resolution, add
             raise ValueError("No scenes found – add narration text to your script.")
         _upd(job_id, 8, f"Found {len(scenes)} scene(s)")
 
-        # 2. TTS narration
+        # 2. TTS narration — all scenes generated in parallel (big speedup)
         _upd(job_id, 10, f"Generating voice ({voice})…")
         tts = TTSService(voice=voice)
-        for i, scene in enumerate(scenes):
+
+        async def _gen_audio(i, scene):
             audio_path = str(job_dir / f"audio_{i:03d}.mp3")
             dur = await tts.generate(scene["narration"], audio_path)
             scene["audio_path"] = audio_path
-            # [duration: N] sets a minimum floor; TTS length always wins if longer
             override = scene.pop("duration_override", None)
             scene["duration"] = max(dur, override) if override else dur
-            _upd(job_id, 10 + int(30 * (i + 1) / len(scenes)),
-                 f"Audio {i+1}/{len(scenes)} ({scene['duration']:.1f}s)")
+            logger.info("Audio %d/%d done (%.1fs)", i + 1, len(scenes), scene["duration"])
+
+        await asyncio.gather(*[_gen_audio(i, s) for i, s in enumerate(scenes)])
+        _upd(job_id, 40, f"All audio ready ({len(scenes)} scenes)")
 
         # 3. Duration cap
         total_dur = sum(s["duration"] for s in scenes)
@@ -172,24 +174,33 @@ async def _run_job(job_id, script, app_url, voice, max_duration, resolution, add
         jobs[job_id].update({"total_scenes": len(scenes), "duration_s": round(total_dur, 1)})
         _upd(job_id, 40, f"Narration: {total_dur:.0f}s across {len(scenes)} scenes")
 
-        # 4. Browser recordings (live video capture)
+        # 4. Browser recordings — run up to 3 scenes in parallel
+        # (semaphore prevents OOM from too many simultaneous Chromium instances)
         _upd(job_id, 42, "Launching headless browser…")
         cap = BrowserCapture(width=w, height=h)
+        sem = asyncio.Semaphore(3)
+        recorded = [None] * len(scenes)
+
+        async def _record_scene(i, scene):
+            async with sem:
+                path = await cap.capture_scene(
+                    url=scene.get("url") or app_url,
+                    action=scene.get("action", "navigate"),
+                    target=scene.get("target", ""),
+                    text=scene.get("text", ""),
+                    wait_for=scene.get("wait_for", ""),
+                    narration=scene.get("narration", ""),
+                    duration=scene["duration"],
+                    output_dir=str(job_dir),
+                    scene_index=i,
+                )
+                recorded[i] = path
+                _upd(job_id, 42 + int(28 * (i + 1) / len(scenes)),
+                     f"Recorded scene {i+1}/{len(scenes)}")
+
+        await asyncio.gather(*[_record_scene(i, s) for i, s in enumerate(scenes)])
         for i, scene in enumerate(scenes):
-            video_path = await cap.capture_scene(
-                url=scene.get("url") or app_url,
-                action=scene.get("action", "navigate"),
-                target=scene.get("target", ""),
-                text=scene.get("text", ""),
-                wait_for=scene.get("wait_for", ""),
-                narration=scene.get("narration", ""),
-                duration=scene["duration"],
-                output_dir=str(job_dir),
-                scene_index=i,
-            )
-            scene["video_path"] = video_path
-            _upd(job_id, 42 + int(28 * (i + 1) / len(scenes)),
-                 f"Recorded scene {i+1}/{len(scenes)}")
+            scene["video_path"] = recorded[i]
 
         # 5. Assemble video
         _upd(job_id, 72, "Assembling video (FFmpeg)…")
