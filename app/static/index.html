@@ -16,6 +16,7 @@
   header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 16px 32px; display: flex; align-items: center; gap: 12px; }
   header .logo { font-size: 22px; font-weight: 700; color: var(--accent); }
   header .sub { color: var(--muted); font-size: 13px; }
+  header .badge { margin-left: auto; background: linear-gradient(135deg,#3882f6,#8b5cf6); color:#fff; font-size:11px; font-weight:600; padding:4px 10px; border-radius:20px; letter-spacing:.04em; }
 
   .container { max-width: 900px; margin: 32px auto; padding: 0 24px; }
 
@@ -61,6 +62,15 @@
 
   .tip { background: #1c2d40; border: 1px solid #1f4580; border-radius: 8px; padding: 12px 16px; font-size: 13px; color: #79c0ff; }
   .tip strong { display: block; margin-bottom: 4px; }
+  .ai-banner { background: linear-gradient(135deg, rgba(56,130,246,.12), rgba(139,92,246,.12)); border: 1px solid rgba(88,166,255,.25); border-radius: 10px; padding: 14px 18px; margin-bottom: 16px; }
+  .ai-banner .ai-title { font-size: 13px; font-weight: 700; color: var(--accent); margin-bottom: 6px; }
+  .ai-banner .ai-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .ai-chip { background: rgba(88,166,255,.12); border: 1px solid rgba(88,166,255,.25); border-radius: 20px; font-size: 11px; color: #79c0ff; padding: 3px 10px; white-space: nowrap; }
+  .scene-preview { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 12px; }
+  .scene-item { display: flex; gap: 10px; align-items: flex-start; padding: 6px 0; border-bottom: 1px solid rgba(48,54,61,.5); font-size: 12px; }
+  .scene-num { background: var(--accent); color:#fff; border-radius:4px; padding:1px 7px; font-weight:700; flex-shrink:0; }
+  .scene-action { color: var(--accent2); font-weight:600; flex-shrink:0; min-width:60px; }
+  .scene-title { color: var(--muted); }
 
   .voice-search { margin-bottom: 8px; }
   .stats { display: flex; gap: 24px; flex-wrap: wrap; margin-top: 12px; }
@@ -76,7 +86,8 @@
 
 <header>
   <div class="logo">🎬 Demo Video Maker</div>
-  <div class="sub">Turn any narrative script + live URL → polished 4-min demo video</div>
+  <div class="sub">Paste any demo narrative → polished 4-min video with synced audio</div>
+  <div class="badge">✨ AI-Powered</div>
 </header>
 
 <div class="container">
@@ -119,12 +130,16 @@
 
   <!-- Script card -->
   <div class="card">
-    <h2>📝 Demo Narrative Script</h2>
-    <div class="tip" style="margin-bottom:16px">
-      <strong>💡 Script Format Tips</strong>
-      Use <code>## Scene Title</code> headings to separate scenes. Add optional directives on their own line:
-      <code>[action: scroll]</code> &nbsp; <code>[url: http://...]</code> &nbsp; <code>[target: .css-selector]</code>
-      <br>Or just paste plain text — each paragraph becomes a scene.
+    <h2>📝 Demo Narrative</h2>
+    <div class="ai-banner">
+      <div class="ai-title">🧠 Smart AI Mode — just paste raw text</div>
+      <div class="ai-chips">
+        <span class="ai-chip">✦ Auto-detects scenes</span>
+        <span class="ai-chip">✦ Infers click / scroll / hover actions</span>
+        <span class="ai-chip">✦ Spotlight highlights UI elements</span>
+        <span class="ai-chip">✦ Subtitles burned into video</span>
+        <span class="ai-chip">✦ Narration guides timing</span>
+      </div>
     </div>
     <div style="margin-bottom:10px;display:flex;gap:10px;align-items:center">
       <label style="cursor:pointer;color:var(--accent);font-size:13px">
@@ -134,7 +149,7 @@
       <span style="color:var(--muted);font-size:12px" id="file-label"></span>
       <button class="btn btn-secondary" style="padding:6px 14px;font-size:12px" onclick="loadSample()">Load Sample</button>
     </div>
-    <textarea id="script" placeholder="## Introduction&#10;Welcome to our platform. Today I'll walk you through the key features.&#10;&#10;## Dashboard Overview&#10;[action: scroll]&#10;Here you can see the main dashboard with all your key metrics at a glance..."></textarea>
+    <textarea id="script" placeholder="Welcome to our platform! Today I'll walk you through the key features.&#10;&#10;Let's start by opening the Dashboard. Here you can see all your key metrics at a glance.&#10;&#10;Now let's navigate to the Client Management section — notice how cases are sorted by priority.&#10;&#10;Let me highlight the Analytics panel. Scroll down to see the full breakdown by segment.&#10;&#10;Finally, let's click on New Client to walk through the onboarding workflow."></textarea>
   </div>
 
   <!-- Action row -->
@@ -157,6 +172,7 @@
       <div class="stat"><div class="num" id="s-scenes">—</div><div class="lbl">Scenes</div></div>
       <div class="stat"><div class="num" id="s-dur">—</div><div class="lbl">Duration</div></div>
     </div>
+    <div id="scene-log" style="margin-top:12px;font-size:12px;color:var(--muted);max-height:120px;overflow-y:auto"></div>
   </div>
 
   <!-- Result card -->
@@ -213,24 +229,18 @@ function filterVoices(q) {
 
 // ── Sample script ────────────────────────────────────────────────────────────
 function loadSample() {
-  document.getElementById('script').value = `---
-title: Platform Demo
----
+  document.getElementById('script').value = `Welcome to our next-generation platform! Today I'll walk you through the key capabilities that help teams move faster and smarter.
 
-## Welcome
-Welcome to our next-generation platform. I'm going to walk you through everything you need to know to get started quickly and efficiently.
+Let's start by opening the Dashboard. Here you can see all your key metrics and KPIs at a single glance — real-time data giving your team instant visibility into everything that matters.
 
-## Dashboard Overview
-[action: scroll]
-Here on the main dashboard, you can see all your key metrics and performance indicators at a single glance. The intuitive layout puts the most important data right in front of you.
+Now let's navigate to the Client Management section. Here you can see all active cases with their current status and priority. Notice how the smart filters let you drill down by region, risk level, or relationship manager in seconds.
 
-## Key Features
-[action: scroll]
-Let me highlight the core features that make our platform stand out. Each module is designed to streamline your workflow and boost your team's productivity.
+Let me highlight the AI Recommendations panel on the right side. The platform analyses historical patterns and surfaces intelligent next-best-actions automatically — no manual configuration required.
 
-## Getting Started
-Now let's see how easy it is to jump in and start using the platform. The onboarding experience is smooth and takes only minutes to complete.`;
-  document.getElementById('hint').textContent = 'Sample loaded – edit as needed';
+Next, let's explore the Analytics Dashboard. Here you can see performance trends, conversion rates, and SLA compliance all visualised in interactive charts. Scroll down to see the full breakdown by segment.
+
+Finally, let me show you how easy it is to onboard a new client. Click on the New Client button to launch the guided workflow. The smart form pre-populates known data and flags any missing information — the whole process takes under three minutes.`;
+  document.getElementById('hint').textContent = 'Sample loaded — pure raw text, no formatting needed!';
 }
 
 function loadFile(input) {
@@ -304,11 +314,20 @@ function updateProgress(job) {
   document.getElementById('prog-fill').style.width = job.progress + '%';
   const msg = document.getElementById('status-msg');
   msg.textContent = job.message;
-  msg.className = 'status-msg';
+  msg.className = 'status-msg' + (job.status === 'failed' ? ' error' : '');
   if (job.total_scenes) {
     document.getElementById('s-scenes').textContent = job.total_scenes;
     document.getElementById('s-dur').textContent = job.duration_s ? job.duration_s + 's' : '—';
     document.getElementById('stats').style.display = 'flex';
+  }
+  // Live progress log
+  const log = document.getElementById('scene-log');
+  if (log && job.message) {
+    const line = document.createElement('div');
+    line.style.cssText = 'padding:2px 0;border-bottom:1px solid rgba(48,54,61,.4);';
+    line.innerHTML = `<span style="color:var(--accent);opacity:.6;margin-right:6px">${new Date().toLocaleTimeString()}</span>${job.message}`;
+    if (log.children.length > 20) log.removeChild(log.lastChild);
+    log.prepend(line);
   }
 }
 

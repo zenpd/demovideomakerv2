@@ -7,6 +7,7 @@ Final     : concat all clips → output MP4
 import asyncio
 import logging
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -20,15 +21,20 @@ _FFPROBE = str(_APP_DIR / "bin" / "ffprobe") if (_APP_DIR / "bin" / "ffprobe").e
 _FPS = 24
 
 _FONT_CANDIDATES = [
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    # Linux (Docker / Ubuntu with fonts-liberation)
     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+    # macOS
+    "/Library/Fonts/Arial.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
     "/System/Library/Fonts/Helvetica.ttc",
 ]
 _BOLD_CANDIDATES = [
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+    "/Library/Fonts/Arial Bold.ttf",
     "/System/Library/Fonts/Helvetica.ttc",
 ]
 
@@ -38,6 +44,105 @@ def _find_font(bold: bool = False) -> str:
         if os.path.exists(p):
             return p
     return ""
+
+
+# ── Subtitle helpers ──────────────────────────────────────────────────────────
+
+def _write_sub(text: str, path: str, max_chars: int = 52) -> bool:
+    """Wrap narration to ≤2 lines and write to subtitle text file."""
+    words = text.split()
+    lines: List[str] = []
+    line: List[str] = []
+    for word in words:
+        if len(' '.join(line + [word])) > max_chars and line:
+            lines.append(' '.join(line))
+            line = [word]
+        else:
+            line.append(word)
+    if line:
+        lines.append(' '.join(line))
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines[:2]))
+        return True
+    except Exception as e:
+        logger.warning("Subtitle write failed %s: %s", path, e)
+        return False
+
+
+def _esc_ff(s: str) -> str:
+    """Escape a path/string for FFmpeg filter syntax."""
+    return s.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+
+
+def _subtitle_vf(
+    sub_file: str,
+    title: str,
+    scene_num: int,
+    total_scenes: int,
+    w: int,
+    h: int,
+    font_path: str = "",
+    bold_path: str = "",
+) -> str:
+    """
+    Build FFmpeg drawtext filter chain:
+      • Dark semi-transparent lower-third band
+      • Scene badge  (top-right corner)
+      • Scene title  (small, accent colour, above subtitles)
+      • Narration subtitle text (white, larger)
+      • Thin gradient-style progress bar at very bottom
+    """
+    fs_sub   = max(20, w // 54)   # subtitle font size
+    fs_title = max(14, w // 72)   # title label font size
+    margin   = max(50, int(h * 0.082))
+    band_h   = max(80, int(h * 0.175))  # lower-third height
+    band_y   = h - band_h
+
+    fp   = f":fontfile='{_esc_ff(font_path)}'"
+    fb   = f":fontfile='{_esc_ff(bold_path)}'"
+    sfp  = fp if font_path else ""
+    sfb  = fb if bold_path else ""
+
+    sf_esc     = _esc_ff(sub_file)
+    safe_title = title[:48].replace("'", "\\'").replace(":", "\\:")
+    badge_txt  = f"SCENE {scene_num}/{total_scenes}".replace("'", "\\'").replace(":", "\\:")
+
+    title_y  = band_y + max(8, int(band_h * 0.12))
+    sub_y    = title_y + fs_title + max(8, int(band_h * 0.12))
+
+    filters = [
+        # Lower-third background band
+        f"drawbox=x=0:y={band_y}:w={w}:h={band_h}:color=black@0.72:t=fill",
+        # Top accent line
+        f"drawbox=x=0:y={band_y}:w={w}:h=3:color=0x3882f6@0.9:t=fill",
+        # Progress bar at very bottom (filled proportional to scene index)
+        f"drawbox=x=0:y={h-4}:w={w}:h=4:color=0x1a2035@1.0:t=fill",
+        f"drawbox=x=0:y={h-4}:w={int(w * scene_num / max(total_scenes,1))}:h=4:color=0x8b5cf6@1.0:t=fill",
+        # Scene title label (small, accent blue)
+        f"drawtext=text='{safe_title}'"
+        f":x=18:y={title_y}"
+        f":fontsize={fs_title}"
+        f":fontcolor=0x58a6ff@0.95"
+        f"{sfb}",
+        # Narration subtitle (white, with subtle shadow)
+        f"drawtext=textfile='{sf_esc}'"
+        f":x=(w-tw)/2"
+        f":y={sub_y}"
+        f":fontsize={fs_sub}"
+        f":fontcolor=white@0.98"
+        f":shadowx=1:shadowy=1:shadowcolor=black@0.8"
+        f":line_spacing=4"
+        f"{sfp}",
+        # Scene badge top-right corner
+        f"drawtext=text='{badge_txt}'"
+        f":x=w-tw-12:y=12"
+        f":fontsize={max(12, w//80)}"
+        f":fontcolor=white@0.85"
+        f":box=1:boxcolor=0x3882f6@0.75:boxborderw=6"
+        f"{sfp}",
+    ]
+    return ",".join(filters)
 
 
 class VideoAssembler:
@@ -50,11 +155,20 @@ class VideoAssembler:
         output_path: str,
         resolution: Tuple[int, int] = (1280, 720),
         demo_title: Optional[str] = None,
+        work_dir: Optional[str] = None,
     ) -> bool:
         if not scenes:
             return False
 
-        work_dir = os.path.dirname(os.path.abspath(output_path))
+        # Use a private temp subdirectory so parallel jobs don't stomp each other
+        import tempfile, uuid as _uuid
+        _own_dir = work_dir is None
+        if _own_dir:
+            work_dir = os.path.join(
+                os.path.dirname(os.path.abspath(output_path)),
+                f"_asm_{_uuid.uuid4().hex[:8]}"
+            )
+            os.makedirs(work_dir, exist_ok=True)
         w, h = resolution
         loop = asyncio.get_event_loop()
         clip_paths: List[str] = []
@@ -81,11 +195,16 @@ class VideoAssembler:
 
         if not clip_paths:
             logger.error("No clips produced – cannot assemble video")
+            if _own_dir:
+                shutil.rmtree(work_dir, ignore_errors=True)
             return False
 
-        return await loop.run_in_executor(
+        result = await loop.run_in_executor(
             None, _concat_clips, clip_paths, output_path, work_dir
         )
+        if _own_dir:
+            shutil.rmtree(work_dir, ignore_errors=True)
+        return result
 
 
 # ── Scene clip ────────────────────────────────────────────────────────────────
@@ -103,12 +222,24 @@ def _scene_clip(
         logger.error("Scene %d: missing audio: %s", idx, audio)
         return False
 
-    # ── Encode: video + audio → output (no overlay) ────────────────────
+    # ── Encode: video + audio → output with rich lower-third ─────────────
     scale_vf = (
         f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
         f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,"
         f"setsar=1,fps={fps}"
     )
+
+    # Build rich subtitle/lower-third overlay
+    sub_file = output + ".sub.txt"
+    narration_text = (narration or "").strip()
+    subtitle_added = False
+    if narration_text and _write_sub(narration_text, sub_file):
+        font = _find_font(bold=False)
+        bold = _find_font(bold=True)
+        sub_vf = _subtitle_vf(sub_file, title, idx + 1, total, w, h, font, bold)
+        if sub_vf:
+            scale_vf = scale_vf + "," + sub_vf
+            subtitle_added = True
 
     if video and os.path.exists(video):
         cmd = [
@@ -138,7 +269,20 @@ def _scene_clip(
 
     if not _run(cmd, timeout=300):
         logger.error("Scene %d encoding failed", idx)
+        # Clean up subtitle temp file on failure too
+        if subtitle_added:
+            try:
+                os.unlink(sub_file)
+            except Exception:
+                pass
         return False
+
+    # Clean up subtitle temp file
+    if subtitle_added:
+        try:
+            os.unlink(sub_file)
+        except Exception:
+            pass
 
     return True
 
@@ -244,7 +388,10 @@ def _concat_clips(clips: List[str], output: str, work_dir: str) -> bool:
 def _run(cmd: List[str], timeout: int = 120) -> bool:
     logger.debug("FFmpeg: %s", " ".join(cmd))
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+            start_new_session=True,  # detach from parent shell's TTY/process-group
+        )
         if r.returncode != 0:
             logger.error("FFmpeg failed (rc=%d): %s", r.returncode, (r.stderr or "")[-1000:])
         return r.returncode == 0
